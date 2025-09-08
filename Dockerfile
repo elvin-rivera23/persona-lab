@@ -3,6 +3,11 @@ FROM python:3.11-slim
 ARG APP_USER=appuser
 ARG APP_HOME=/app
 
+# Build metadata (passed from compose/Makefile)
+ARG BUILD_DATE="unknown"
+ARG GIT_SHA="unknown"
+ARG GIT_BRANCH="unknown"
+
 RUN apt-get update \
     && apt-get install -y --no-install-recommends curl \
     && rm -rf /var/lib/apt/lists/*
@@ -13,13 +18,23 @@ WORKDIR ${APP_HOME}
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
+# App code + version file
 COPY app ./app
 COPY VERSION ./VERSION
 
+# Runtime env (can be overridden)
 ENV APP_HOST=0.0.0.0 \
     APP_PORT=8001 \
     WORKERS=1 \
-    PYTHONUNBUFFERED=1
+    PYTHONUNBUFFERED=1 \
+    BUILD_DATE=${BUILD_DATE} \
+    GIT_SHA=${GIT_SHA} \
+    GIT_BRANCH=${GIT_BRANCH}
+
+# OCI labels (nice-to-have metadata)
+LABEL org.opencontainers.image.created=${BUILD_DATE} \
+      org.opencontainers.image.revision=${GIT_SHA} \
+      org.opencontainers.image.version=${GIT_SHA}
 
 EXPOSE 8001
 

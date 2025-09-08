@@ -4,6 +4,10 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+      args:
+        BUILD_DATE: ${BUILD_DATE}
+        GIT_SHA: ${GIT_SHA}
+        GIT_BRANCH: ${GIT_BRANCH}
     env_file:
       - .env
       - .env.example
@@ -26,6 +30,10 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+      args:
+        BUILD_DATE: ${BUILD_DATE}
+        GIT_SHA: ${GIT_SHA}
+        GIT_BRANCH: ${GIT_BRANCH}
     env_file:
       - .env
       - .env.example
