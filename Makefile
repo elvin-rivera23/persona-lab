@@ -10,22 +10,26 @@ BUILD_DATE := $(shell date -u +"%Y-%m-%dT%H:%M:%SZ")
 
 export GIT_SHA GIT_BRANCH BUILD_DATE APP_PORT
 
-.PHONY: help dev-up dev-down pi-up pi-down logs test lint curl-health curl-meta
+.PHONY: help dev-up dev-up-wait dev-down pi-up pi-up-wait pi-down logs test lint curl-health curl-meta wait
 
 help:
 	@echo "Targets:"
-	@echo "  dev-up     - compose up (dev profile), rebuild with build metadata"
-	@echo "  dev-down   - compose down (dev profile)"
-	@echo "  pi-up      - compose up (pi profile), rebuild with build metadata"
-	@echo "  pi-down    - compose down (pi profile)"
-	@echo "  logs       - follow compose logs"
-	@echo "  test       - run pytest in a one-off python:3.11-slim container"
-	@echo "  lint       - run ruff in a one-off container"
-	@echo "  curl-health- curl /health"
-	@echo "  curl-meta  - curl /__meta"
+	@echo "  dev-up        - compose up (dev), rebuild with build metadata"
+	@echo "  dev-up-wait   - dev-up and wait until /health is ready"
+	@echo "  dev-down      - compose down (dev)"
+	@echo "  pi-up         - compose up (pi), rebuild with build metadata"
+	@echo "  pi-up-wait    - pi-up and wait until /health is ready"
+	@echo "  pi-down       - compose down (pi)"
+	@echo "  logs          - follow compose logs"
+	@echo "  test          - run pytest in a one-off python:3.11-slim container"
+	@echo "  lint          - run ruff in a one-off container"
+	@echo "  curl-health   - curl /health"
+	@echo "  curl-meta     - curl /__meta"
 
 dev-up:
 	docker compose --profile dev up -d --build api-dev
+
+dev-up-wait: dev-up wait
 
 dev-down:
 	docker compose --profile dev down
@@ -33,11 +37,24 @@ dev-down:
 pi-up:
 	docker compose --profile pi up -d --build api-pi
 
+pi-up-wait: pi-up wait
+
 pi-down:
 	docker compose --profile pi down
 
 logs:
 	docker compose logs -f
+
+wait:
+	@echo "Waiting for API on port $(APP_PORT) ..."
+	@for i in $$(seq 1 30); do \
+	  if curl -fsS http://localhost:$(APP_PORT)/health >/dev/null 2>&1; then \
+	    echo "API is healthy ✅"; exit 0; \
+	  else \
+	    sleep 1; \
+	  fi; \
+	done; \
+	echo "API did not become healthy in time ❌"; exit 1
 
 test:
 	docker run --rm -v "$$PWD":/work -w /work python:3.11-slim \
