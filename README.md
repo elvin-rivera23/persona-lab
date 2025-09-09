@@ -1,9 +1,8 @@
-![CI](https://github.com/elvin-rivera23/persona-lab/actions/workflows/ci.yml/badge.svg)
+[![CI](https://github.com/elvin-rivera23/persona-lab/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/elvin-rivera23/persona-lab/actions/workflows/ci.yml)
 
 # persona-lab
 
-
-# Persona Lab — Foundation & Portability
+## Persona Lab — Foundation & Portability
 
 Tiny FastAPI skeleton with Docker + Compose profiles for dev (PC/Mac/Linux) and pi (Raspberry Pi 5).
 
