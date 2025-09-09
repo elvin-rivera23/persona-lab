@@ -39,3 +39,17 @@ docker compose logs -f
 - Health and version endpoints exist for checks and monitoring.
 - Use `.env` for runtime overrides; commit only `.env.example`.
 - Images are portable (amd64/arm64).
+
+## Development
+
+For a consistent workflow, use the Makefile:
+
+```bash
+make up          # start api + worker (wait until /health passes)
+make up-all      # start api + worker + monitor
+make logs        # tail logs (Ctrl+C to stop)
+make logs_once   # show last 100 log lines
+make smoke-all   # run health checks on all services
+make test        # run unit tests in container
+make down        # stop and clean up
+```
