@@ -9,6 +9,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Query, Response, status
+from fastapi.responses import HTMLResponse
 
 # Personality catalog (ASCII + quotes/tips + picker)
 from app.worker.personality import ASCII_LOGO, QUOTES, TIPS, pick_by_day
@@ -174,3 +175,106 @@ def fun_motd():
         },
         "as_of": utc_now_iso(),
     }
+
+
+@app.get("/fun/playground", tags=["fun"], response_class=HTMLResponse)
+def fun_playground():
+    """A tiny HTML playground that calls /fun/motd and /fun/teapot."""
+    html = f"""
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>{APP_NAME} — Playground</title>
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<style>
+  :root {{ color-scheme: light dark; }}
+  body {{ font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace; margin: 24px; }}
+  pre#logo {{ white-space: pre; font-size: 12px; line-height: 1.1; margin: 0 0 8px 0; }}
+  .card {{ border: 1px solid #8884; border-radius: 12px; padding: 16px; margin: 12px 0; }}
+  button {{ padding: 8px 12px; border-radius: 8px; cursor: pointer; }}
+  #toast {{ position: fixed; right: 12px; bottom: 12px; background: #333; color:#fff; padding: 8px 12px; border-radius: 8px; display:none; }}
+  canvas#confetti {{ position: fixed; inset: 0; pointer-events: none; }}
+</style>
+</head>
+<body>
+  <h1>Persona Lab — Playground</h1>
+
+  <div class="card">
+    <pre id="logo"></pre>
+    <div><strong>Quote:</strong> <span id="motd-quote">loading…</span></div>
+    <div><strong>Tip:</strong> <span id="motd-tip">loading…</span></div>
+  </div>
+
+  <div class="card">
+    <button id="brew-418">Brew a 418</button>
+    <pre id="teapot-out"></pre>
+  </div>
+
+  <div id="toast"></div>
+  <canvas id="confetti"></canvas>
+
+<script>
+async function loadMOTD() {{
+  const r = await fetch('/fun/motd');
+  if (!r.ok) throw new Error('motd failed');
+  const data = await r.json();
+  document.getElementById('logo').textContent = data.logo || '';
+  document.getElementById('motd-quote').textContent = data.quote || '';
+  document.getElementById('motd-tip').textContent = data.tip || '';
+}}
+
+async function brew418() {{
+  const r = await fetch('/fun/teapot');
+  const txt = await r.text();
+  document.getElementById('teapot-out').textContent = txt;
+  if (r.status === 418) {{
+    toast('418: I\\'m a teapot ☕');
+    confetti();
+  }} else {{
+    toast('Not a teapot: ' + r.status);
+  }}
+}}
+
+function toast(msg) {{
+  const el = document.getElementById('toast');
+  el.textContent = msg;
+  el.style.display = 'block';
+  setTimeout(() => el.style.display = 'none', 1800);
+}}
+
+function confetti() {{
+  const c = document.getElementById('confetti');
+  const ctx = c.getContext('2d');
+  const W = c.width = window.innerWidth;
+  const H = c.height = window.innerHeight;
+  const N = 80;
+  const parts = Array.from({{length: N}}, () => ({{
+    x: Math.random() * W,
+    y: -20 - Math.random()*H*0.3,
+    vx: (Math.random()-0.5)*2,
+    vy: 2 + Math.random()*3,
+    r: 2 + Math.random()*3
+  }}));
+  let t = 0;
+  const id = setInterval(() => {{
+    t++;
+    ctx.clearRect(0,0,W,H);
+    for (const p of parts) {{
+      p.x += p.vx;
+      p.y += p.vy;
+      ctx.beginPath();
+      ctx.arc(p.x, p.y, p.r, 0, Math.PI*2);
+      ctx.fill();
+    }}
+    if (t > 90) clearInterval(id);
+  }}, 16);
+}}
+
+document.getElementById('brew-418').addEventListener('click', brew418);
+loadMOTD().catch(() => toast('Failed to load MOTD'));
+</script>
+</body>
+</html>
+    """
+    return HTMLResponse(content=html, status_code=200)
