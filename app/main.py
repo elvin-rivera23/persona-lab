@@ -1,8 +1,9 @@
 import os
 import platform
 import sys
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
+
 from fastapi import FastAPI
 
 app = FastAPI(title="Persona Lab API")
@@ -19,7 +20,7 @@ def read_version() -> str:
 
 def iso_now() -> str:
     """UTC timestamp ISO8601."""
-    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    return datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 @app.get("/health")

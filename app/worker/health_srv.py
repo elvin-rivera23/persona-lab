@@ -4,6 +4,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 
 PORT = 8022
 
+
 class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path == "/health":
@@ -20,6 +21,7 @@ class Handler(BaseHTTPRequestHandler):
     # Be quiet in logs (avoid noisy 200 lines)
     def log_message(self, format, *args):
         return
+
 
 if __name__ == "__main__":
     server = HTTPServer(("0.0.0.0", PORT), Handler)
