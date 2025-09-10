@@ -39,6 +39,9 @@ docker compose logs -f
 - Health and version endpoints exist for checks and monitoring.
 - Use `.env` for runtime overrides; commit only `.env.example`.
 - Images are portable (amd64/arm64).
+- Default API port is 8001 (used in CI).
+- If running multiple projects locally, you can override the host port:
+  `API_PORT=8002 docker compose up -d api`
 
 ## Development
 

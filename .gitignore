@@ -5,6 +5,7 @@ __pycache__/
 *.pyd
 *.egg-info/
 .venv/
+.pytest_cache/
 
 # Env
 .env
@@ -16,3 +17,6 @@ __pycache__/
 
 # Docker
 *.log
+
+# Local-only compose overrides
+docker-compose.override.yml
