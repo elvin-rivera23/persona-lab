@@ -17,3 +17,6 @@ __pycache__/
 
 # Docker
 *.log
+
+# Local-only compose overrides
+docker-compose.override.yml
