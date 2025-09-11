@@ -18,7 +18,7 @@ services:
     ports:
       - "${API_PORT:-8001}:8001"
     env_file:
-      - .env
+      - .env.example
     environment:
       # Keep your existing app envs
       APP_ENV: "dev"

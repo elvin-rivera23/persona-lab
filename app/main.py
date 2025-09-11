@@ -11,7 +11,7 @@ from pathlib import Path
 from threading import Lock
 from typing import Any
 
-from fastapi import FastAPI, HTTPException, Query, Response, status
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
 
@@ -224,6 +224,7 @@ def fun_motd():
     quote = QUOTES[day_idx]
     tip = TIPS[day_idx % len(TIPS)]
     build = {
+        "service": "persona-lab",
         "version": read_version_fallback(),
         "host": HOST,
         "port": PORT,
@@ -234,7 +235,7 @@ def fun_motd():
 @app.get("/fun/emoji", tags=["fun"])
 def fun_emoji(mood: str = Query(..., description="happy|sad|cool|party|thinking")):
     if mood not in EMOJI_MAP:
-        raise HTTPException(status_code=400, detail="unknown mood")
+        raise HTTPException(status_code=400, detail="Unsupported mood")
     return {"mood": mood, "emoji": EMOJI_MAP[mood], "as_of": utc_now_iso()}
 
 
@@ -244,13 +245,13 @@ def fun_roll(
     n: int = Query(1, ge=1, le=100, description="number of dice"),
 ):
     rolls = [random.randint(1, d) for _ in range(n)]
-    return {"d": d, "n": n, "rolls": rolls, "total": sum(rolls), "as_of": utc_now_iso()}
+    return {"sides": d, "count": n, "rolls": rolls, "total": sum(rolls), "as_of": utc_now_iso()}
 
 
 @app.get("/fun/teapot", tags=["fun"])
 def fun_teapot():
     # Tests expect 418
-    return Response(content="I'm a teapot! ☕", status_code=status.HTTP_418_IM_A_TEAPOT)
+    return {"status": "teapot", "message": "I'm a teapot! ☕"}
 
 
 @app.get("/fun/playground", response_class=HTMLResponse, tags=["fun"])
