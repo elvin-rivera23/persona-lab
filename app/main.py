@@ -250,8 +250,10 @@ def fun_roll(
 
 @app.get("/fun/teapot", tags=["fun"])
 def fun_teapot():
-    # Tests expect 418
-    return {"status": "teapot", "message": "I'm a teapot! ☕"}
+    # Tests expect 418 and JSON body
+    from fastapi.responses import JSONResponse
+
+    return JSONResponse({"status": "teapot", "message": "I'm a teapot! ☕"}, status_code=418)
 
 
 @app.get("/fun/playground", response_class=HTMLResponse, tags=["fun"])
