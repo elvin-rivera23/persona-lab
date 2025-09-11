@@ -5,6 +5,7 @@ import os
 import platform
 import random
 import time
+import uuid
 from collections import Counter
 from datetime import UTC, datetime
 from pathlib import Path
@@ -15,6 +16,10 @@ from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
 
+# NEW: A/B attribution + leaderboard aggregation
+from app.ab_track import aggregate_with_feedback
+from app.ab_track import init as ab_init
+from app.ab_track import record_interaction
 from app.engagement import get_feedback_summary, get_recent_feedback, init_db, insert_feedback
 from app.personas.playful import respond as playful_respond
 
@@ -86,6 +91,7 @@ class FeedbackOut(BaseModel):
 class ABRequest(BaseModel):
     user_id: str
     prompt: str
+    session_id: str | None = None  # NEW: allow session attribution
     deterministic: bool | None = False  # if True, always pick top-weight policy
 
 
@@ -95,11 +101,13 @@ class ABResponse(BaseModel):
     policy_weights: dict[str, float]
     response: dict[str, Any]
     took_ms: int
+    interaction_id: str  # NEW: so feedback can reference which interaction was rated
 
 
 @app.on_event("startup")
 def _init_engagement_db():
     init_db()
+    ab_init()  # NEW: ensure ab_interactions table exists
 
 
 # -------------------------
@@ -441,7 +449,7 @@ def predict_ab(req: ABRequest):
 
     picked = blender.choose_policy(stochastic=not req.deterministic)
 
-    # ---- record metrics
+    # ---- record metrics (in-memory counters)
     with _AB_LOCK:
         AB_COUNTER[(group, picked)] += 1
         AB_TOTAL[group] += 1
@@ -461,6 +469,18 @@ def predict_ab(req: ABRequest):
 
     took_ms = int((time.time() - t0) * 1000)
 
+    # ---- NEW: persist interaction for attribution
+    interaction_id = str(uuid.uuid4())
+    try:
+        record_interaction(
+            interaction_id=interaction_id,
+            ab_group=group,
+            persona=picked,
+            session_id=req.session_id,
+        )
+    except Exception as e:
+        log.error(f'ab_track_error interaction_id="{interaction_id}" err="{e}"')
+
     log.info(
         f'ab_event user_id="{req.user_id}" group="{group}" picked="{picked}" took_ms={took_ms}'
     )
@@ -471,6 +491,7 @@ def predict_ab(req: ABRequest):
         policy_weights=blender.policies,
         response=resp_payload,
         took_ms=took_ms,
+        interaction_id=interaction_id,  # NEW
     )
 
 
@@ -494,3 +515,14 @@ def ab_reset():
         AB_COUNTER.clear()
         AB_TOTAL.clear()
     return {"status": "ok", "message": "AB counters reset"}
+
+
+# NEW: leaderboard endpoint (variant-aware)
+@app.get("/leaderboard", tags=["ab"])
+def leaderboard(days: int = Query(30, ge=1, le=365)):
+    """
+    Aggregated feedback per A/B group and persona using a Wilson lower bound
+    for 'positive' rate (score >= 4) plus average score.
+    """
+    rows = aggregate_with_feedback(limit_days=days)
+    return {"as_of": utc_now_iso(), "days": days, "results": rows}
