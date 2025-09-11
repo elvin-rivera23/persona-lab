@@ -1,3 +1,5 @@
+version: "3.9"
+
 # Optional: a reusable logging config for tidy JSON logs
 x-logging: &default-logging
   driver: json-file
@@ -15,8 +17,16 @@ services:
     command: uvicorn app.main:app --host 0.0.0.0 --port 8001
     ports:
       - "${API_PORT:-8001}:8001"
+    env_file:
+      - .env.example
     environment:
+      # Keep your existing app envs
       APP_ENV: "dev"
+      # NEW: pass DB_PATH into the container (defaults to /data/engagement.db)
+      DB_PATH: "${DB_PATH:-/data/engagement.db}"
+    volumes:
+      # NEW: persist the SQLite file to the host
+      - ./data:/data:rw
     healthcheck:
       test:
         [
