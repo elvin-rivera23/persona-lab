@@ -17,14 +17,30 @@ DEFAULT_DB_REL = "data/engagement.db"
 
 def _get_db_path() -> str:
     """
-    Return an ABSOLUTE path to the SQLite file and ensure the parent directory exists.
-    Works reliably in Docker, CI, and local runs.
+    Return an ABSOLUTE path to the SQLite file.
+    - Prefer DB_PATH or ./data/engagement.db
+    - Ensure the parent dir exists
+    - If the directory is not writable (e.g., CI/compose), fall back to /tmp/persona-lab
     """
-    raw = os.getenv("DB_PATH", DEFAULT_DB_REL)
+    raw = os.getenv("DB_PATH", "data/engagement.db")
     p = Path(raw)
     if not p.is_absolute():
-        p = Path.cwd() / p  # anchor relative paths to the current working dir (/app in Docker)
-    p.parent.mkdir(parents=True, exist_ok=True)
+        p = Path.cwd() / p  # e.g., /app/data/engagement.db in Docker
+
+    try:
+        p.parent.mkdir(parents=True, exist_ok=True)
+        # simple write check: can we create (or touch) the file?
+        if p.exists():
+            p.touch(exist_ok=True)
+        else:
+            # create an empty file and remove it; just to test permissions
+            p.touch()
+            p.unlink()
+    except Exception:
+        # read-only image or non-writable workdir — use /tmp
+        p = Path("/tmp/persona-lab/engagement.db")
+        p.parent.mkdir(parents=True, exist_ok=True)
+
     return str(p)
 
 
