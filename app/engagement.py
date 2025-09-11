@@ -20,6 +20,10 @@ def _get_db_path() -> str:
 
 def _connect() -> sqlite3.Connection:
     # isolation_level=None gives autocommit-like behavior
+    # Ensure parent directory exists (works in CI/container too)
+    import os
+
+    os.makedirs(os.path.dirname(_get_db_path()), exist_ok=True)
     conn = sqlite3.connect(_get_db_path(), timeout=5, isolation_level=None)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL;")
