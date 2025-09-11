@@ -2,6 +2,7 @@ import os
 import sqlite3
 import time
 import uuid
+from pathlib import Path
 from typing import Any
 
 # What it does:
@@ -11,20 +12,29 @@ from typing import Any
 # Pitfalls:
 # - SQLite is single-writer. Fine for our scale; migrate to Postgres later if needed.
 
-DEFAULT_DB_PATH = "./data/engagement.db"
+DEFAULT_DB_REL = "data/engagement.db"
 
 
 def _get_db_path() -> str:
-    return os.getenv("DB_PATH", DEFAULT_DB_PATH)
+    """
+    Return an ABSOLUTE path to the SQLite file and ensure the parent directory exists.
+    Works reliably in Docker, CI, and local runs.
+    """
+    raw = os.getenv("DB_PATH", DEFAULT_DB_REL)
+    p = Path(raw)
+    if not p.is_absolute():
+        p = Path.cwd() / p  # anchor relative paths to the current working dir (/app in Docker)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    return str(p)
 
 
 def _connect() -> sqlite3.Connection:
-    # isolation_level=None gives autocommit-like behavior
-    # Ensure parent directory exists (works in CI/container too)
-    import os
+    # Ensure directory exists even if caller bypasses _get_db_path.
+    db_path = _get_db_path()
+    Path(db_path).parent.mkdir(parents=True, exist_ok=True)
 
-    os.makedirs(os.path.dirname(_get_db_path()), exist_ok=True)
-    conn = sqlite3.connect(_get_db_path(), timeout=5, isolation_level=None)
+    # isolation_level=None gives autocommit-like behavior
+    conn = sqlite3.connect(db_path, timeout=5, isolation_level=None)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL;")
     conn.execute("PRAGMA foreign_keys=ON;")
