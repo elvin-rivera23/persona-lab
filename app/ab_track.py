@@ -1,125 +1,119 @@
-# app/ab_track.py
-# Persist A/B interactions to SQLite alongside engagement, and satisfy
-# feedback.interaction_id -> interactions(id) FK without altering legacy schema.
-
 from __future__ import annotations
 
 import os
 import sqlite3
+import time
+from collections.abc import Iterator
 from contextlib import contextmanager
-from datetime import UTC, datetime
-from typing import Any
+from pathlib import Path
 
-# Reuse your existing engagement DB
-DB_PATH = os.getenv("ENGAGEMENT_DB_PATH", "./data/engagement.db")
-
-DDL = """
--- Legacy parent table (exists already in your DB, usually with only id column).
--- We include IF NOT EXISTS for fresh setups; on existing DB, it will be ignored.
-CREATE TABLE IF NOT EXISTS interactions (
-    id TEXT PRIMARY KEY
-);
-
--- Auxiliary AB table to hold rich attribution details.
-CREATE TABLE IF NOT EXISTS ab_interactions (
-    interaction_id TEXT PRIMARY KEY,
-    created_at INTEGER NOT NULL,
-    session_id TEXT,
-    ab_group TEXT NOT NULL,
-    persona   TEXT NOT NULL
-);
-CREATE INDEX IF NOT EXISTS idx_ab_interactions_group_persona
-  ON ab_interactions(ab_group, persona, created_at);
-"""
+# Resolve DB path; default to ./data/engagement.db relative to app root
+DB_PATH = Path(os.getenv("ENGAGEMENT_DB_PATH", "./data/engagement.db"))
+DATA_DIR = DB_PATH.parent
 
 
 @contextmanager
-def _conn():
-    conn = sqlite3.connect(DB_PATH)
+def _conn() -> Iterator[sqlite3.Connection]:
+    # Ensure directory exists (fixes "unable to open database file" in CI/container)
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(DB_PATH), timeout=5)
     try:
+        conn.execute("PRAGMA foreign_keys = ON;")
         yield conn
+        conn.commit()
     finally:
         conn.close()
 
 
-def init():
+def init() -> None:
+    """Create required tables (idempotent)."""
     with _conn() as c:
-        cur = c.cursor()
-        cur.executescript(DDL)
-        c.commit()
+        c.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS interactions (
+                id TEXT PRIMARY KEY
+            );
+
+            CREATE TABLE IF NOT EXISTS ab_interactions (
+                interaction_id TEXT PRIMARY KEY,
+                created_at INTEGER NOT NULL,
+                session_id TEXT,
+                ab_group TEXT NOT NULL,
+                persona TEXT NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_ab_interactions_created
+            ON ab_interactions(created_at);
+            """
+        )
 
 
 def record_interaction(
-    interaction_id: str, ab_group: str, persona: str, session_id: str | None = None
+    interaction_id: str,
+    ab_group: str,
+    persona: str,
+    session_id: str | None = None,
 ) -> None:
-    """
-    Insert into interactions(id) ONLY (to satisfy FK) and into ab_interactions with details.
-    This avoids altering legacy schema while preserving rich data for leaderboard.
-    """
-    ts = int(datetime.now(UTC).timestamp())
+    """Insert parent id (for FK) + rich A/B attributes."""
+    now = int(time.time())
     with _conn() as c:
-        cur = c.cursor()
-        # Satisfy FK: ensure a row exists in interactions with the given id
-        cur.execute(
-            "INSERT OR IGNORE INTO interactions (id) VALUES (?)",
-            (interaction_id,),
+        c.execute("INSERT OR IGNORE INTO interactions(id) VALUES (?);", (interaction_id,))
+        c.execute(
+            """
+            INSERT OR REPLACE INTO ab_interactions(interaction_id, created_at, session_id, ab_group, persona)
+            VALUES (?, ?, ?, ?, ?);
+            """,
+            (interaction_id, now, session_id, ab_group, persona),
         )
-        # Keep detailed record in our auxiliary table
-        cur.execute(
-            "INSERT OR REPLACE INTO ab_interactions (interaction_id, created_at, session_id, ab_group, persona) VALUES (?,?,?,?,?)",
-            (interaction_id, ts, session_id, ab_group, persona),
-        )
-        c.commit()
 
 
-def aggregate_with_feedback(limit_days: int = 30) -> list[dict[str, Any]]:
-    """
-    Join ab_interactions with feedback (which references interactions(id)) to compute aggregates.
-    feedback schema (from engagement.py):
-      feedback(id PK, created_at INTEGER epoch, session_id TEXT, interaction_id TEXT, score INTEGER, notes TEXT)
-    """
-    cutoff = int(datetime.now(UTC).timestamp()) - limit_days * 86400
-    sql = """
-    SELECT ai.ab_group, ai.persona,
-           COUNT(f.id)                                AS n_feedback,
-           AVG(CAST(f.score AS REAL))                 AS avg_score,
-           SUM(CASE WHEN f.score >= 4 THEN 1 ELSE 0 END) AS pos,
-           SUM(CASE WHEN f.score <= 2 THEN 1 ELSE 0 END) AS neg
-      FROM ab_interactions ai
- LEFT JOIN feedback f
-        ON f.interaction_id = ai.interaction_id
-     WHERE ai.created_at >= ?
-  GROUP BY ai.ab_group, ai.persona
-  ORDER BY n_feedback DESC, avg_score DESC;
-    """
-    out: list[dict[str, Any]] = []
-    with _conn() as c:
-        cur = c.cursor()
-        cur.execute(sql, (cutoff,))
-        for row in cur.fetchall():
-            ab_group, persona, n_feedback, avg_score, pos, neg = row
-            n = int(n_feedback or 0)
-            p = (pos or 0) / n if n > 0 else 0.0
-            wilson = _wilson_lower_bound(p, n)
-            out.append(
-                {
-                    "group": ab_group,
-                    "persona": persona,
-                    "n_feedback": n,
-                    "avg_score": float(avg_score) if avg_score is not None else None,
-                    "pos": int(pos or 0),
-                    "neg": int(neg or 0),
-                    "wilson_lb": wilson,
-                }
-            )
-    return out
-
-
-def _wilson_lower_bound(p_hat: float, n: int, z: float = 1.96) -> float:
-    # 95% Wilson lower bound for a binomial proportion (robust at low N)
+def _wilson_lower_bound(pos: int, n: int, z: float = 1.96) -> float:
     if n == 0:
         return 0.0
-    denom = 1 + z * z / n
-    center = p_hat + z * z / (2 * n)
-    margin = z * ((p_hat * (1 - p_hat) / n + z * z / (4 * n * n)) ** 0.5)
-    return max(0.0, (center - margin) / denom)
+    p_hat = pos / n
+    denom = 1 + (z**2) / n
+    centre = p_hat + (z**2) / (2 * n)
+    margin = z * ((p_hat * (1 - p_hat) + (z**2) / (4 * n)) / n) ** 0.5
+    return max(0.0, (centre - margin) / denom)
+
+
+def aggregate_with_feedback(limit_days: int = 30) -> list[dict]:
+    """Join ab_interactions with feedback and compute aggregates per (group, persona)."""
+    cutoff = int(time.time()) - limit_days * 86400
+    with _conn() as c:
+        rows = c.execute(
+            """
+            SELECT
+              a.ab_group,
+              a.persona,
+              COUNT(f.id) AS n_fb,
+              COALESCE(AVG(f.score), 0) AS avg_score,
+              SUM(CASE WHEN f.score >= 4 THEN 1 ELSE 0 END) AS pos,
+              SUM(CASE WHEN f.score <= 2 THEN 1 ELSE 0 END) AS neg
+            FROM ab_interactions a
+            LEFT JOIN feedback f ON f.interaction_id = a.interaction_id
+            WHERE a.created_at >= ?
+            GROUP BY a.ab_group, a.persona
+            ORDER BY a.ab_group, a.persona;
+            """,
+            (cutoff,),
+        ).fetchall()
+
+    out: list[dict] = []
+    for grp, persona, n_fb, avg_score, pos, neg in rows:
+        n = int(n_fb or 0)
+        pos = int(pos or 0)
+        neg = int(neg or 0)
+        lb = _wilson_lower_bound(pos, n)
+        out.append(
+            {
+                "group": grp,
+                "persona": persona,
+                "n_feedback": n,
+                "avg_score": float(avg_score or 0.0),
+                "pos": pos,
+                "neg": neg,
+                "wilson_lb": lb,
+            }
+        )
+    return out
