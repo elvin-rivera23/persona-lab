@@ -16,10 +16,8 @@ from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
 
-# NEW (7B): A/B attribution + leaderboard aggregation
-from app.ab_track import aggregate_with_feedback
+from app.ab_track import aggregate_with_feedback, record_interaction
 from app.ab_track import init as ab_init
-from app.ab_track import record_interaction
 from app.engagement import get_feedback_summary, get_recent_feedback, init_db, insert_feedback
 from app.personas.playful import respond as playful_respond
 from app.personas.serious import respond as serious_respond
