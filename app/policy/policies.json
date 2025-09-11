@@ -1,0 +1,14 @@
+{
+  "default": {
+    "serious": 0.7,
+    "playful": 0.3
+  },
+  "variant_a": {
+    "serious": 0.8,
+    "playful": 0.2
+  },
+  "variant_b": {
+    "serious": 0.5,
+    "playful": 0.5
+  }
+}
