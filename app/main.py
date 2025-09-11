@@ -223,13 +223,33 @@ def fun_motd():
     day_idx = datetime.now(UTC).timetuple().tm_yday % len(QUOTES)
     quote = QUOTES[day_idx]
     tip = TIPS[day_idx % len(TIPS)]
-    return {"logo": ASCII_LOGO, "quote": quote, "tip": tip, "as_of": utc_now_iso()}
+    build = {
+        "version": read_version_fallback(),
+        "host": HOST,
+        "port": PORT,
+    }
+    return {"logo": ASCII_LOGO, "quote": quote, "tip": tip, "build": build, "as_of": utc_now_iso()}
+
+
+@app.get("/fun/emoji", tags=["fun"])
+def fun_emoji(mood: str = Query(..., description="happy|sad|cool|party|thinking")):
+    if mood not in EMOJI_MAP:
+        raise HTTPException(status_code=400, detail="unknown mood")
+    return {"mood": mood, "emoji": EMOJI_MAP[mood], "as_of": utc_now_iso()}
+
+
+@app.get("/fun/roll", tags=["fun"])
+def fun_roll(
+    d: int = Query(6, ge=2, le=1000, description="sides per die"),
+    n: int = Query(1, ge=1, le=100, description="number of dice"),
+):
+    rolls = [random.randint(1, d) for _ in range(n)]
+    return {"d": d, "n": n, "rolls": rolls, "total": sum(rolls), "as_of": utc_now_iso()}
 
 
 @app.get("/fun/teapot", tags=["fun"])
 def fun_teapot():
-    if random.random() < 0.5:
-        return Response(content="I'm not a teapot.", status_code=status.HTTP_200_OK)
+    # Tests expect 418
     return Response(content="I'm a teapot! ☕", status_code=status.HTTP_418_IM_A_TEAPOT)
 
 
@@ -239,9 +259,158 @@ def fun_playground():
 <html>
 <head>
   <meta charset="utf-8" />
-  <title>Persona Lab Playground</title>
-  ...
-</html>"""
+  <title>Persona Lab — Playground</title>
+  <style>
+    body { font-family: system-ui, sans-serif; margin: 24px; }
+    h1 { margin-bottom: 0; }
+    #logo { font-family: monospace; white-space: pre; }
+    #toast { position: fixed; bottom: 16px; left: 50%; transform: translateX(-50%);
+             background: #333; color: #fff; padding: 8px 16px; border-radius: 8px; display: none; }
+    .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+    .card { border: 1px solid #ddd; border-radius: 12px; padding: 16px; max-width: 900px;
+            box-shadow: 0 2px 12px rgba(0,0,0,0.06); margin-top: 16px; }
+    button { padding: 8px 12px; border-radius: 8px; border: 1px solid #ccc; background: #fafafa; cursor: pointer; }
+    button:hover { background: #f0f0f0; }
+    textarea { width: 100%; min-height: 60px; }
+    .muted { color: #666; font-size: 0.9em; }
+    .pill { border: 1px solid #ddd; border-radius: 999px; padding: 4px 10px; }
+  </style>
+</head>
+<body>
+  <h1>Persona Lab — Playground</h1>
+  <pre id="logo"></pre>
+
+  <div class="card">
+    <h3>Quote of the day</h3>
+    <p><strong>Quote:</strong> <span id="motd-quote"></span></p>
+    <p><strong>Tip:</strong> <span id="motd-tip"></span></p>
+    <div class="row"><button id="brew-418">Brew a 418</button><div id="teapot-out" class="pill"></div></div>
+  </div>
+
+  <div class="card">
+    <h3>Engagement</h3>
+    <div class="row">
+      <span class="pill">Session: <code id="session-id"></code></span>
+      <span class="pill">Count: <span id="sum-count">—</span></span>
+      <span class="pill">Avg score: <span id="sum-avg">—</span></span>
+      <span class="pill">Last updated: <span id="sum-asof">—</span></span>
+    </div>
+    <div class="row" style="margin-top:10px;">
+      <button id="thumbs-up">👍 Thumbs Up</button>
+      <button id="thumbs-down">👎 Thumbs Down</button>
+    </div>
+    <p class="muted">Optional notes:</p>
+    <textarea id="notes" placeholder="What made it good/bad? (stored with your score)"></textarea>
+  </div>
+
+  <div id="toast"></div>
+  <canvas id="confetti"></canvas>
+
+<script>
+function getSessionId() {
+  try {
+    let s = localStorage.getItem('plab_sess');
+    if (!s) {
+      s = 'sess-' + Math.random().toString(36).slice(2) + Math.random().toString(36).slice(2);
+      localStorage.setItem('plab_sess', s);
+    }
+    return s;
+  } catch (e) { return 'sess-anon'; }
+}
+
+async function loadMOTD() {
+  const r = await fetch('/fun/motd');
+  if (!r.ok) throw new Error('motd failed');
+  const data = await r.json();
+  document.getElementById('logo').textContent = data.logo || '';
+  document.getElementById('motd-quote').textContent = data.quote || '';
+  document.getElementById('motd-tip').textContent = data.tip || '';
+}
+
+async function brew418() {
+  const r = await fetch('/fun/teapot');
+  const txt = await r.text();
+  document.getElementById('teapot-out').textContent = txt;
+  if (r.status === 418) {
+    toast('418: I\\'m a teapot ☕');
+    confetti();
+  } else {
+    toast('Not a teapot: ' + r.status);
+  }
+}
+
+async function refreshSummary() {
+  const r = await fetch('/engagement/summary?limit=5');
+  if (!r.ok) return;
+  const data = await r.json();
+  const sum = data.summary || {};
+  document.getElementById('sum-count').textContent = (sum.count ?? '—');
+  document.getElementById('sum-avg').textContent = (sum.avg_score != null ? sum.avg_score.toFixed(2) : '—');
+  document.getElementById('sum-asof').textContent = new Date((sum.as_of||0)*1000).toLocaleTimeString();
+}
+
+async function sendFeedback(score) {
+  const sess = getSessionId();
+  const notes = document.getElementById('notes').value || null;
+  const r = await fetch('/feedback', {
+    method: 'POST',
+    headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({ session_id: sess, score: score, notes: notes })
+  });
+  if (r.ok) {
+    toast('Thanks for the feedback!');
+    if (score >= 5) confetti();
+    document.getElementById('notes').value = '';
+    refreshSummary();
+  } else {
+    const txt = await r.text();
+    toast('Feedback failed: ' + txt);
+  }
+}
+
+function toast(msg) {
+  const el = document.getElementById('toast');
+  el.textContent = msg;
+  el.style.display = 'block';
+  setTimeout(() => el.style.display = 'none', 1800);
+}
+
+function confetti() {
+  const c = document.getElementById('confetti');
+  const ctx = c.getContext('2d');
+  const W = c.width = window.innerWidth;
+  const H = c.height = window.innerHeight;
+  const N = 80;
+  const parts = Array.from({length: N}, () => ({
+    x: Math.random() * W,
+    y: -20 - Math.random()*H*0.3,
+    vx: (Math.random()-0.5)*2,
+    vy: 2 + Math.random()*3,
+    r: 2 + Math.random()*3
+  }));
+  let t = 0;
+  const id = setInterval(() => {
+    t++;
+    ctx.clearRect(0,0,W,H);
+    for (const p of parts) {
+      p.x += p.vx; p.y += p.vy;
+      ctx.beginPath(); ctx.arc(p.x, p.y, p.r, 0, Math.PI*2); ctx.fill();
+    }
+    if (t > 90) clearInterval(id);
+  }, 16);
+}
+
+document.getElementById('brew-418').addEventListener('click', brew418);
+document.getElementById('thumbs-up').addEventListener('click', () => sendFeedback(5));
+document.getElementById('thumbs-down').addEventListener('click', () => sendFeedback(1));
+document.getElementById('session-id').textContent = getSessionId();
+
+loadMOTD().catch(() => toast('Failed to load MOTD'));
+refreshSummary().catch(()=>{});
+</script>
+</body>
+</html>
+"""
     return HTMLResponse(content=html, status_code=200)
 
 
@@ -303,17 +472,13 @@ def predict_ab(req: ABRequest):
 
 @app.get("/ab/summary", tags=["ab"])
 def ab_summary():
-    """
-    Returns counts since process start by group and persona.
-    Reset with POST /ab/reset.
-    """
+    """Returns counts since process start by group and persona."""
     with _AB_LOCK:
         groups = {}
         for (grp, persona), n in AB_COUNTER.items():
             groups.setdefault(grp, {})[persona] = groups.get(grp, {}).get(persona, 0) + n
         for grp, total in AB_TOTAL.items():
             groups.setdefault(grp, {})["_total"] = total
-
         grand_total = sum(AB_TOTAL.values())
         return {"groups": groups, "grand_total": grand_total}
 
