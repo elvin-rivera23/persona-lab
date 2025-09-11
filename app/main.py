@@ -16,20 +16,14 @@ from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
 
-# NEW: A/B attribution + leaderboard aggregation
+# NEW (7B): A/B attribution + leaderboard aggregation
 from app.ab_track import aggregate_with_feedback
 from app.ab_track import init as ab_init
 from app.ab_track import record_interaction
 from app.engagement import get_feedback_summary, get_recent_feedback, init_db, insert_feedback
 from app.personas.playful import respond as playful_respond
-
-# Personas
 from app.personas.serious import respond as serious_respond
-
-# A/B policy engine
 from app.policy.ab import assign_ab, get_policy
-
-# Personality catalog (ASCII + quotes/tips + picker)
 from app.worker.personality import ASCII_LOGO, QUOTES, TIPS
 
 APP_NAME = "persona-lab"
@@ -48,7 +42,7 @@ def utc_now_iso() -> str:
     return datetime.now(UTC).isoformat()
 
 
-# Env-configured runtime info (keeps tests portable while providing sensible defaults)
+# Env-configured runtime info
 HOST = os.getenv("APP_HOST", "0.0.0.0")
 PORT = int(os.getenv("APP_PORT", "8001"))
 WORKERS = int(os.getenv("APP_WORKERS", "1"))
@@ -60,7 +54,7 @@ app = FastAPI(
 )
 
 # -------------------------
-# Logging (for A/B events too)
+# Logging
 # -------------------------
 log = logging.getLogger("persona_lab")
 if not log.handlers:
@@ -70,11 +64,10 @@ if not log.handlers:
     log.addHandler(handler)
     log.setLevel(logging.INFO)
 
-# -------------------------
-# Feedback models & startup
-# -------------------------
 
-
+# -------------------------
+# Models & startup
+# -------------------------
 class FeedbackIn(BaseModel):
     session_id: str | None = Field(None, description="Opaque session identifier")
     interaction_id: str | None = Field(None, description="Optional prior interaction id")
@@ -87,11 +80,10 @@ class FeedbackOut(BaseModel):
     feedback_id: str
 
 
-# ---- A/B Models (for blending experiments)
 class ABRequest(BaseModel):
     user_id: str
     prompt: str
-    session_id: str | None = None  # NEW: allow session attribution
+    session_id: str | None = None  # (7B/7C) allow session attribution
     deterministic: bool | None = False  # if True, always pick top-weight policy
 
 
@@ -101,20 +93,18 @@ class ABResponse(BaseModel):
     policy_weights: dict[str, float]
     response: dict[str, Any]
     took_ms: int
-    interaction_id: str  # NEW: so feedback can reference which interaction was rated
+    interaction_id: str  # (7B/7C) used by the UI to tie feedback
 
 
 @app.on_event("startup")
 def _init_engagement_db():
     init_db()
-    ab_init()  # NEW: ensure ab_interactions table exists
+    ab_init()  # ensure ab_interactions + interactions table(s) exist
 
 
 # -------------------------
 # Core endpoints
 # -------------------------
-
-
 @app.get("/health", tags=["core"])
 def health():
     return {"status": "ok"}
@@ -168,8 +158,6 @@ def meta():
 # -------------------------
 # Feedback endpoints
 # -------------------------
-
-
 @app.post("/feedback", response_model=FeedbackOut, tags=["core"])
 def post_feedback(payload: FeedbackIn):
     try:
@@ -200,9 +188,8 @@ def engagement_summary(
 
 
 # -------------------------
-# Personality & Fun pack
+# Fun endpoints (with Playground wired for 7C)
 # -------------------------
-
 GREET_TAGLINES = [
     "Let’s ship something cool today.",
     "Pi-first, portable everywhere.",
@@ -319,6 +306,8 @@ def fun_playground():
   <canvas id="confetti"></canvas>
 
 <script>
+let currentInteractionId = null;
+
 function getSessionId() {
   try {
     let s = localStorage.getItem('plab_sess');
@@ -351,6 +340,23 @@ async function brew418() {
   }
 }
 
+async function predict(promptText) {
+  // Call /predict_ab and capture the interaction_id for attribution
+  const sess = getSessionId();
+  const r = await fetch('/predict_ab', {
+    method: 'POST',
+    headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({ user_id: sess, session_id: sess, prompt: promptText || 'Hello!' })
+  });
+  if (!r.ok) {
+    toast('Prediction failed');
+    return null;
+  }
+  const data = await r.json();
+  currentInteractionId = data.interaction_id || null;
+  return data;
+}
+
 async function refreshSummary() {
   const r = await fetch('/engagement/summary?limit=5');
   if (!r.ok) return;
@@ -362,12 +368,22 @@ async function refreshSummary() {
 }
 
 async function sendFeedback(score) {
+  // Ensure we have an active interaction; if not, fetch one
+  if (!currentInteractionId) {
+    await predict('Hello!');
+  }
   const sess = getSessionId();
   const notes = document.getElementById('notes').value || null;
+  const payload = {
+    interaction_id: currentInteractionId,
+    session_id: sess,
+    score: score,
+    notes: notes
+  };
   const r = await fetch('/feedback', {
     method: 'POST',
     headers: {'Content-Type':'application/json'},
-    body: JSON.stringify({ session_id: sess, score: score, notes: notes })
+    body: JSON.stringify(payload)
   });
   if (r.ok) {
     toast('Thanks for the feedback!');
@@ -417,8 +433,10 @@ document.getElementById('thumbs-up').addEventListener('click', () => sendFeedbac
 document.getElementById('thumbs-down').addEventListener('click', () => sendFeedback(1));
 document.getElementById('session-id').textContent = getSessionId();
 
+// Boot: load MOTD, pull summary, and pre-create an interaction_id for this session
 loadMOTD().catch(() => toast('Failed to load MOTD'));
 refreshSummary().catch(()=>{});
+predict('Hello!').catch(()=>{});
 </script>
 </body>
 </html>
@@ -427,10 +445,8 @@ refreshSummary().catch(()=>{});
 
 
 # -------------------------
-# A/B policy endpoints
+# A/B policy endpoints (with interaction_id + attribution)
 # -------------------------
-
-# In-memory AB counters
 AB_COUNTER = Counter()  # key: (group, persona)
 AB_TOTAL = Counter()  # key: group
 _AB_LOCK = Lock()
@@ -446,15 +462,14 @@ def read_policy(name: str = Query("default", description="Policy name to inspect
 def predict_ab(req: ABRequest):
     t0 = time.time()
     group, blender = assign_ab(req.user_id)
-
     picked = blender.choose_policy(stochastic=not req.deterministic)
 
-    # ---- record metrics (in-memory counters)
+    # record in-memory counts
     with _AB_LOCK:
         AB_COUNTER[(group, picked)] += 1
         AB_TOTAL[group] += 1
 
-    # Route to real persona responders
+    # route to persona responders
     if picked == "serious":
         text = serious_respond(req.prompt)
     elif picked == "playful":
@@ -469,7 +484,7 @@ def predict_ab(req: ABRequest):
 
     took_ms = int((time.time() - t0) * 1000)
 
-    # ---- NEW: persist interaction for attribution
+    # NEW (7B): persist interaction for FK + leaderboard attribution
     interaction_id = str(uuid.uuid4())
     try:
         record_interaction(
@@ -491,7 +506,7 @@ def predict_ab(req: ABRequest):
         policy_weights=blender.policies,
         response=resp_payload,
         took_ms=took_ms,
-        interaction_id=interaction_id,  # NEW
+        interaction_id=interaction_id,  # (7B/7C) UI will send this back to /feedback
     )
 
 
@@ -517,7 +532,7 @@ def ab_reset():
     return {"status": "ok", "message": "AB counters reset"}
 
 
-# NEW: leaderboard endpoint (variant-aware)
+# NEW (7B): leaderboard endpoint (variant-aware)
 @app.get("/leaderboard", tags=["ab"])
 def leaderboard(days: int = Query(30, ge=1, le=365)):
     """
