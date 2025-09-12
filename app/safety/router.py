@@ -2,11 +2,11 @@
 import time
 from typing import Any
 
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, Request, Response
 from pydantic import BaseModel
 
 from app.config import settings
-from app.safety.exit_reasons import SafetyExit
+from app.safety.exit_reasons import SafetyExit, SafetyExitReason
 from app.safety.guard import SafetyGuard
 from app.safety.taxonomy import get_taxonomy
 from app.safety.timeout import run_with_timeout
@@ -41,23 +41,51 @@ _guard = SafetyGuard(
 
 
 def _emit_safety_metric(req: GenerateRequest, exit_obj: SafetyExit, elapsed_ms: int) -> None:
+    """
+    Best-effort emission to Milestone 7 analytics. We don't assume a fixed signature.
+    Tries keyword style, then positional; otherwise silently no-ops.
+    """
     if not HAVE_METRICS:
         return
-    record_interaction(
-        persona=req.persona or "default",
-        prompt=req.prompt[:2000],
-        response="",
-        label=f"SAFETY_EXIT:{exit_obj.reason.value}",
-        meta={
-            "elapsed_ms": elapsed_ms,
-            "severity": exit_obj.severity,
-            "details": exit_obj.details or {},
-        },
-    )
+    try:
+        # Attempt a keyword-based call (one common shape)
+        record_interaction(
+            persona=req.persona or "default",
+            message=req.prompt[:2000],  # avoid giant logs
+            response="",
+            label=f"SAFETY_EXIT:{exit_obj.reason.value}",
+            meta={
+                "elapsed_ms": elapsed_ms,
+                "severity": exit_obj.severity,
+                "details": exit_obj.details or {},
+            },
+        )
+        return
+    except TypeError:
+        pass
+    except Exception:
+        return
+
+    # Fallback: positional shape (persona, message, response, label, meta)
+    try:
+        record_interaction(
+            req.persona or "default",
+            (req.prompt or "")[:2000],
+            "",
+            f"SAFETY_EXIT:{exit_obj.reason.value}",
+            {
+                "elapsed_ms": elapsed_ms,
+                "severity": exit_obj.severity,
+                "details": exit_obj.details or {},
+            },
+        )
+    except Exception:
+        # If analytics signature doesn't match, skip quietly
+        return
 
 
 @router.post("/generate", response_model=GenerateResponse)
-async def safety_generate(req: GenerateRequest, request: Request):
+async def safety_generate(req: GenerateRequest, request: Request, response: Response):
     started_ms = int(time.time() * 1000)
     budget_ms = req.latency_budget_ms or settings.SAFETY_DEFAULT_LATENCY_BUDGET_MS
 
@@ -71,6 +99,7 @@ async def safety_generate(req: GenerateRequest, request: Request):
     if exit_obj:
         elapsed = int(time.time() * 1000) - started_ms
         _emit_safety_metric(req, exit_obj, elapsed)
+        response.headers["X-Safety-Exit"] = exit_obj.reason.value
         return GenerateResponse(
             exit=exit_obj.to_dict(),
             output=None,
@@ -90,6 +119,7 @@ async def safety_generate(req: GenerateRequest, request: Request):
 
     if during_exit:
         _emit_safety_metric(req, during_exit, elapsed)
+        response.headers["X-Safety-Exit"] = during_exit.reason.value
         return GenerateResponse(
             exit=during_exit.to_dict(),
             output=None,
@@ -127,3 +157,38 @@ async def safety_config():
         "denylist": settings.SAFETY_DENYLIST,
         "default_latency_budget_ms": settings.SAFETY_DEFAULT_LATENCY_BUDGET_MS,
     }
+
+
+@router.get("/test")
+async def safety_test(reason: str = "unspecified"):
+    """
+    Synthesize a given exit reason for demo/QA without crafting prompts.
+    Usage: /safety/test?reason=kill_switch
+    """
+    try:
+        r = SafetyExitReason(reason)
+    except ValueError:
+        r = SafetyExitReason.UNSPECIFIED
+
+    # Minimal, safe defaults
+    severity = {
+        SafetyExitReason.KILL_SWITCH: "high",
+        SafetyExitReason.SENSITIVE_PII: "high",
+        SafetyExitReason.JAILBREAK_DETECTED: "medium",
+        SafetyExitReason.POLICY_VIOLATION: "medium",
+        SafetyExitReason.PROMPT_TOO_LONG: "low",
+        SafetyExitReason.LATENCY_BUDGET: "low",
+        SafetyExitReason.TOKEN_BUDGET: "low",
+        SafetyExitReason.COST_BUDGET: "low",
+        SafetyExitReason.RATE_LIMIT: "low",
+        SafetyExitReason.MALFORMED_INPUT: "low",
+        SafetyExitReason.UNSPECIFIED: "low",
+    }.get(r, "low")
+
+    exit_obj = SafetyExit(
+        reason=r,
+        severity=severity,
+        message=f"Synthesized exit: {r.value}",
+        details={"source": "safety_test"},
+    )
+    return {"exit": exit_obj.to_dict()}
