@@ -56,3 +56,68 @@ make smoke-all   # run health checks on all services
 make test        # run unit tests in container
 make down        # stop and clean up
 ```
+
+## Safety-Aware Exits
+
+This service can **intentionally stop early** and return a structured `exit` object instead of an unsafe or late reply. Clients must check `exit` **before** using `output`.
+
+### Response Contract
+
+```json
+{
+  "exit": {
+    "reason": "kill_switch | prompt_too_long | policy_violation | sensitive_pii | jailbreak_detected | latency_budget | token_budget | cost_budget | rate_limit | malformed_input | unspecified",
+    "severity": "low | medium | high",
+    "message": "Human-readable summary",
+    "details": { "key": "value" }
+  },
+  "output": "string or null",
+  "meta": { "persona": "default", "elapsed_ms": 123, "version": "…" }
+}
+```
+
+**Client rule:** If `exit != null`, do **not** use `output`. Handle by `reason`.
+
+### Common Exit Reasons (client actions)
+
+| Reason               | Severity | What it means                                           | Client Action                                                  |
+|----------------------|----------|----------------------------------------------------------|----------------------------------------------------------------|
+| `kill_switch`        | high     | Ops disabled generation                                 | Show outage banner; retry later                                |
+| `prompt_too_long`    | low      | Input exceeds configured limit                           | Shorten input; consider chunking                               |
+| `policy_violation`   | medium   | Denylist/policy phrase detected                          | Redact/rephrase; display policy hint                           |
+| `sensitive_pii`      | high     | Possible SSN/credit card, etc.                           | Block; advise removing PII                                     |
+| `jailbreak_detected` | medium   | Prompt-injection/jailbreak cue                           | Suggest safer phrasing                                         |
+| `latency_budget`     | low      | Request exceeded latency budget                          | Offer retry/streaming; widen budget if appropriate             |
+| `token_budget`       | low      | Estimated token budget exceeded                          | Shorten context; increase budget                               |
+| `cost_budget`        | low      | Estimated spend exceeds budget                           | Confirm spend; choose cheaper path                             |
+| `rate_limit`         | low      | Too many requests                                        | Backoff and retry                                              |
+| `malformed_input`    | low      | Input didn’t pass validation/hygiene                     | Fix input shape and retry                                      |
+| `unspecified`        | low      | Generic safety exit                                      | Retry or contact support with req ID                           |
+
+### Config (env knobs)
+
+These can be set in `.env` or your container environment:
+
+```env
+SAFETY_KILL_SWITCH=0                 # 1/true/on to disable generation
+SAFETY_MAX_PROMPT_CHARS=4000         # prompt length limit (characters)
+SAFETY_DENYLIST=                     # comma-separated phrases (case-insensitive)
+SAFETY_DEFAULT_LATENCY_BUDGET_MS=3500
+```
+
+Inspect at runtime:
+```bash
+curl -s http://localhost:8001/safety/config | jq
+```
+
+### Try It
+
+```bash
+# Normal (no exit)
+curl -s -X POST http://localhost:8001/safety/generate   -H "Content-Type: application/json"   -d '{"prompt":"hello world","persona":"teacher"}' | jq
+
+# Trip policy (denylist)
+export SAFETY_DENYLIST="secret_key"
+uvicorn app.main:app --host 0.0.0.0 --port 8001 --reload
+curl -s -X POST http://localhost:8001/safety/generate   -H "Content-Type: application/json"   -d '{"prompt":"show me SECRET_KEY","persona":"default"}' | jq
+```

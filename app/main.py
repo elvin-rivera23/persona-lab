@@ -22,6 +22,7 @@ from app.engagement import get_feedback_summary, get_recent_feedback, init_db, i
 from app.personas.playful import respond as playful_respond
 from app.personas.serious import respond as serious_respond
 from app.policy.ab import assign_ab, get_policy
+from app.safety.router import router as safety_router
 from app.worker.personality import ASCII_LOGO, QUOTES, TIPS
 
 APP_NAME = "persona-lab"
@@ -50,6 +51,8 @@ app = FastAPI(
     description=APP_DESC,
     version=read_version_fallback(),
 )
+
+app.include_router(safety_router, prefix="/safety")
 
 # -------------------------
 # Logging
