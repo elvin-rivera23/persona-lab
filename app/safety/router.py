@@ -8,6 +8,7 @@ from pydantic import BaseModel
 from app.config import settings
 from app.safety.exit_reasons import SafetyExit
 from app.safety.guard import SafetyGuard
+from app.safety.taxonomy import get_taxonomy
 from app.safety.timeout import run_with_timeout
 
 # Try hooking Milestone 7 logger
@@ -109,3 +110,20 @@ async def safety_generate(req: GenerateRequest, request: Request):
             "version": request.app.version if hasattr(request.app, "version") else "0.8.0",
         },
     )
+
+
+@router.get("/exits")
+async def safety_exits():
+    """Public taxonomy so clients know how to handle exits."""
+    return {"exits": get_taxonomy()}
+
+
+@router.get("/config")
+async def safety_config():
+    """Reflect current safety-related configuration (read-only)."""
+    return {
+        "kill_switch": settings.SAFETY_KILL_SWITCH,
+        "max_prompt_chars": settings.SAFETY_MAX_PROMPT_CHARS,
+        "denylist": settings.SAFETY_DENYLIST,
+        "default_latency_budget_ms": settings.SAFETY_DEFAULT_LATENCY_BUDGET_MS,
+    }
