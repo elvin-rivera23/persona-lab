@@ -4,14 +4,16 @@ import time
 from typing import Any
 
 from .exit_reasons import SafetyExit, SafetyExitReason
+from .patterns import contains_jailbreak, contains_pii
 
 
 class SafetyGuard:
     """
-    Minimal first-pass guard:
+    Minimal first-pass guard (extended):
       - kill switch via env
       - prompt length limit
       - simple denylist (placeholder for policy)
+      - PII & jailbreak pattern checks
       - latency watchdog (budget declared per-request; simulated check)
     """
 
@@ -61,7 +63,27 @@ class SafetyGuard:
                     details={"keyword": word},
                 )
 
-        # 4) Latency watchdog (best-effort, check elapsed so far)
+        # 4) PII detection
+        pii_kind = contains_pii(prompt)
+        if pii_kind:
+            return SafetyExit(
+                reason=SafetyExitReason.SENSITIVE_PII,
+                severity="high",
+                message="Prompt appears to contain sensitive PII.",
+                details={"pii": pii_kind},
+            )
+
+        # 5) Jailbreak cues
+        jb_phrase = contains_jailbreak(prompt)
+        if jb_phrase:
+            return SafetyExit(
+                reason=SafetyExitReason.JAILBREAK_DETECTED,
+                severity="medium",
+                message="Prompt contains jailbreak/prompt-injection cues.",
+                details={"phrase": jb_phrase},
+            )
+
+        # 6) Latency watchdog (best-effort, check elapsed so far)
         if latency_budget_ms is not None and started_at_ms is not None:
             now = int(time.time() * 1000)
             if now - started_at_ms > latency_budget_ms:
@@ -69,10 +91,7 @@ class SafetyGuard:
                     reason=SafetyExitReason.LATENCY_BUDGET,
                     severity="low",
                     message="Latency budget exceeded before generation.",
-                    details={
-                        "elapsed_ms": now - started_at_ms,
-                        "budget_ms": latency_budget_ms,
-                    },
+                    details={"elapsed_ms": now - started_at_ms, "budget_ms": latency_budget_ms},
                 )
 
         # No exit
