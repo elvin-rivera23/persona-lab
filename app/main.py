@@ -1,12 +1,14 @@
 from __future__ import annotations
 
-import logging
+import asyncio
 import os
 import platform
 import random
 import time
 import uuid
 from collections import Counter
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager, suppress
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from threading import Lock
@@ -37,6 +39,7 @@ from app.monetization.metrics import metrics
 from app.monetization.models import MonetizationPlan
 from app.monetization.router import get_guard
 from app.monetization.router import router as monetization_router
+from app.observability import RequestIdMiddleware, setup_json_logging
 from app.personas.playful import respond as playful_respond
 from app.personas.serious import respond as serious_respond
 from app.policy.ab import assign_ab, get_policy
@@ -54,7 +57,6 @@ APP_VERSION_FILE = Path(__file__).resolve().parents[1] / "VERSION"
 
 
 def read_version_fallback() -> str:
-    """Return a version string from VERSION file; fall back to 0.0.0 if unavailable."""
     try:
         return APP_VERSION_FILE.read_text(encoding="utf-8").strip()
     except Exception:
@@ -66,40 +68,66 @@ def utc_now_iso() -> str:
 
 
 def next_utc_midnight_iso() -> str:
-    """Compute the next UTC midnight timestamp in ISO-8601."""
     now = datetime.now(UTC)
     tomorrow = (now + timedelta(days=1)).date()
     nxt = datetime(tomorrow.year, tomorrow.month, tomorrow.day, tzinfo=UTC)
     return nxt.isoformat()
 
 
-# Environment-configured runtime info (used in /version and /fun/motd)
 HOST = os.getenv("APP_HOST", "0.0.0.0")
 PORT = int(os.getenv("APP_PORT", "8001"))
 WORKERS = int(os.getenv("APP_WORKERS", "1"))
+
+# ------------------------------------------------------------------------------
+# Readiness / lifespan
+# ------------------------------------------------------------------------------
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+    app.state.is_ready = False
+    app.state._bg_tasks = []
+
+    # Keep startup snappy; add dependency checks here if needed.
+    await asyncio.sleep(0)
+
+    app.state.is_ready = True
+    try:
+        yield
+    finally:
+        # Stop advertising readiness so upstreams drain requests.
+        app.state.is_ready = False
+
+        # Best-effort cancellation of background tasks.
+        bg_tasks = getattr(app.state, "_bg_tasks", [])
+        for t in bg_tasks:
+            with suppress(Exception):
+                t.cancel()
+        if bg_tasks:
+            await asyncio.gather(*bg_tasks, return_exceptions=True)
+
 
 app = FastAPI(
     title=APP_NAME,
     description=APP_DESC,
     version=read_version_fallback(),
+    lifespan=lifespan,
 )
 
+# ------------------------------------------------------------------------------
+# Logging (JSON) + Request IDs
+# ------------------------------------------------------------------------------
+
+log = setup_json_logging("persona_lab")
+app.add_middleware(RequestIdMiddleware, logger=log)
+
+# ------------------------------------------------------------------------------
 # Routers
+# ------------------------------------------------------------------------------
+
 app.include_router(safety_router, prefix="/safety")
 app.include_router(generate_router, prefix="/safety")
-app.include_router(monetization_router)  # provides /monetization/*
-
-# ------------------------------------------------------------------------------
-# Logging
-# ------------------------------------------------------------------------------
-
-log = logging.getLogger("persona_lab")
-if not log.handlers:
-    handler = logging.StreamHandler()
-    fmt = logging.Formatter('{"ts":"%(asctime)s","level":"%(levelname)s","msg":"%(message)s"}')
-    handler.setFormatter(fmt)
-    log.addHandler(handler)
-    log.setLevel(logging.INFO)
+app.include_router(monetization_router)  # /monetization/*
 
 # ------------------------------------------------------------------------------
 # Models & startup
@@ -121,8 +149,8 @@ class FeedbackOut(BaseModel):
 class ABRequest(BaseModel):
     user_id: str
     prompt: str
-    session_id: str | None = None  # allows attribution across requests
-    deterministic: bool | None = False  # if True, always pick top-weight policy
+    session_id: str | None = None
+    deterministic: bool | None = False
 
 
 class ABResponse(BaseModel):
@@ -136,14 +164,25 @@ class ABResponse(BaseModel):
 
 @app.on_event("startup")
 def _init_engagement_db():
-    """Initialize persistence for engagement tracking and A/B logs."""
     init_db()
     ab_init()
 
 
 # ------------------------------------------------------------------------------
-# Core endpoints
+# Ops/health endpoints
 # ------------------------------------------------------------------------------
+
+
+@app.get("/live", tags=["ops"])
+def live():
+    return {"status": "live"}
+
+
+@app.get("/ready", tags=["ops"])
+def ready(request: Request):
+    if getattr(request.app.state, "is_ready", False):
+        return {"status": "ready"}
+    return JSONResponse({"status": "not_ready"}, status_code=503)
 
 
 @app.get("/health", tags=["core"])
@@ -289,7 +328,6 @@ def fun_roll(
 
 @app.get("/fun/teapot", tags=["fun"])
 def fun_teapot():
-    # Some tests expect HTTP 418 with a JSON body
     body = {"code": 418, "status": "teapot", "message": "I'm a teapot! ☕"}
     return JSONResponse(body, status_code=418)
 
@@ -383,7 +421,6 @@ async function brew418() {
 }
 
 async function predict(promptText) {
-  // Call /predict_ab and capture the interaction_id for attribution
   const sess = getSessionId();
   const r = await fetch('/predict_ab', {
     method: 'POST',
@@ -411,7 +448,6 @@ async function refreshSummary() {
 }
 
 async function sendFeedback(score) {
-  // Ensure we have an active interaction; if not, fetch one
   if (!currentInteractionId) {
     await predict('Hello!');
   }
@@ -476,7 +512,6 @@ document.getElementById('thumbs-up').addEventListener('click', () => sendFeedbac
 document.getElementById('thumbs-down').addEventListener('click', () => sendFeedback(1));
 document.getElementById('session-id').textContent = getSessionId();
 
-// Boot: load MOTD, pull summary, and pre-create an interaction_id for this session
 loadMOTD().catch(() => toast('Failed to load MOTD'));
 refreshSummary().catch(()=>{});
 predict('Hello!').catch(()=>{});
@@ -502,17 +537,11 @@ def read_policy(name: str = Query("default", description="Policy name to inspect
     return {"name": name, "weights": blender.policies}
 
 
-# Dependency type for resolving client identity and plan (ruff-friendly)
 ResolvedClient = Annotated[tuple[str, MonetizationPlan], Depends(resolve_client)]
 
 
 @app.post("/predict_ab", response_model=ABResponse, tags=["ab"])
 def predict_ab(req: ABRequest, request: Request, response: Response, id_and_plan: ResolvedClient):
-    """
-    Predict with A/B policy selection. Applies monetization enforcement and
-    records per-plan/client metrics. On success, returns quota headers.
-    """
-    # Monetization enforcement
     client_id, plan = id_and_plan
     allowed, used, cap = get_guard().check_and_increment(client_id, plan)
     if not allowed:
@@ -535,23 +564,19 @@ def predict_ab(req: ABRequest, request: Request, response: Response, id_and_plan
 
     metrics.record(client_id, plan.value, "ALLOWED", used, cap)
 
-    # Quota headers on success (remaining after this request)
     remaining = max(0, cap - used)
     response.headers[HDR_QUOTA_REMAINING] = str(remaining)
     response.headers[HDR_PLAN] = plan.value
     response.headers[HDR_CLIENT] = client_id
 
-    # Primary inference flow
     t0 = time.time()
     group, blender = assign_ab(req.user_id)
     picked = blender.choose_policy(stochastic=not req.deterministic)
 
-    # Update in-memory A/B counters
     with _AB_LOCK:
         AB_COUNTER[(group, picked)] += 1
         AB_TOTAL[group] += 1
 
-    # Generate response text from selected persona
     if picked == "serious":
         text = serious_respond(req.prompt)
     elif picked == "playful":
@@ -566,7 +591,6 @@ def predict_ab(req: ABRequest, request: Request, response: Response, id_and_plan
 
     took_ms = int((time.time() - t0) * 1000)
 
-    # Persist interaction for engagement and attribution
     interaction_id = str(uuid.uuid4())
     try:
         record_interaction(
@@ -576,10 +600,21 @@ def predict_ab(req: ABRequest, request: Request, response: Response, id_and_plan
             session_id=req.session_id,
         )
     except Exception as e:
-        log.error(f'ab_track_error interaction_id="{interaction_id}" err="{e}"')
+        log.error(
+            'ab_track_error interaction_id="%s" err="%s"',
+            interaction_id,
+            e,
+            extra={"request_id": "-"},
+        )
 
     log.info(
-        f'ab_event user_id="{req.user_id}" group="{group}" picked="{picked}" took_ms={took_ms} client="{client_id}" plan="{plan.value}"'
+        'ab_event user_id="%s" group="%s" picked="%s" took_ms=%d client="%s" plan="%s"',
+        req.user_id,
+        group,
+        picked,
+        took_ms,
+        client_id,
+        plan.value,
     )
 
     return ABResponse(
@@ -594,9 +629,8 @@ def predict_ab(req: ABRequest, request: Request, response: Response, id_and_plan
 
 @app.get("/ab/summary", tags=["ab"])
 def ab_summary():
-    """Return in-process A/B selection counts grouped by variant and persona."""
     with _AB_LOCK:
-        groups = {}
+        groups: dict[str, dict[str, int]] = {}
         for (grp, persona), n in AB_COUNTER.items():
             groups.setdefault(grp, {})[persona] = groups.get(grp, {}).get(persona, 0) + n
         for grp, total in AB_TOTAL.items():
@@ -607,7 +641,6 @@ def ab_summary():
 
 @app.post("/ab/reset", tags=["ab"])
 def ab_reset():
-    """Clear the in-memory A/B counters (useful during demos/tests)."""
     with _AB_LOCK:
         AB_COUNTER.clear()
         AB_TOTAL.clear()
@@ -616,9 +649,5 @@ def ab_reset():
 
 @app.get("/leaderboard", tags=["ab"])
 def leaderboard(days: int = Query(30, ge=1, le=365)):
-    """
-    Aggregate feedback by A/B group and persona using Wilson lower bound for
-    positive rate (score >= 4) plus average score.
-    """
     rows = aggregate_with_feedback(limit_days=days)
     return {"as_of": utc_now_iso(), "days": days, "results": rows}
