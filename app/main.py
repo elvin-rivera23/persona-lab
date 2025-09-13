@@ -7,18 +7,25 @@ import random
 import time
 import uuid
 from collections import Counter
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from threading import Lock
 from typing import Any
 
-from fastapi import FastAPI, HTTPException, Query
-from fastapi.responses import HTMLResponse
+from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel, Field
 
 from app.ab_track import aggregate_with_feedback, record_interaction
 from app.ab_track import init as ab_init
+from app.deps import resolve_client  # ← NEW
 from app.engagement import get_feedback_summary, get_recent_feedback, init_db, insert_feedback
+from app.monetization.router import (
+    get_guard,  # ← NEW
+)
+from app.monetization.router import (
+    router as monetization_router,  # ← NEW
+)
 from app.personas.playful import respond as playful_respond
 from app.personas.serious import respond as serious_respond
 from app.policy.ab import assign_ab, get_policy
@@ -42,6 +49,14 @@ def utc_now_iso() -> str:
     return datetime.now(UTC).isoformat()
 
 
+def next_utc_midnight_iso() -> str:
+    """Return the next UTC midnight boundary in ISO-8601."""
+    now = datetime.now(UTC)
+    tomorrow = (now + timedelta(days=1)).date()
+    nxt = datetime(tomorrow.year, tomorrow.month, tomorrow.day, tzinfo=UTC)
+    return nxt.isoformat()
+
+
 # Env-configured runtime info
 HOST = os.getenv("APP_HOST", "0.0.0.0")
 PORT = int(os.getenv("APP_PORT", "8001"))
@@ -53,8 +68,10 @@ app = FastAPI(
     version=read_version_fallback(),
 )
 
+# Routers
 app.include_router(safety_router, prefix="/safety")
 app.include_router(generate_router, prefix="/safety")
+app.include_router(monetization_router)  # router provides /monetization/*
 
 # -------------------------
 # Logging
@@ -249,8 +266,6 @@ def fun_roll(
 @app.get("/fun/teapot", tags=["fun"])
 def fun_teapot():
     # Tests expect HTTP 418 and JSON including { code: 418 }
-    from fastapi.responses import JSONResponse
-
     body = {"code": 418, "status": "teapot", "message": "I'm a teapot! ☕"}
     return JSONResponse(body, status_code=418)
 
@@ -352,7 +367,8 @@ async function predict(promptText) {
     body: JSON.stringify({ user_id: sess, session_id: sess, prompt: promptText || 'Hello!' })
   });
   if (!r.ok) {
-    toast('Prediction failed');
+    const txt = await r.text();
+    toast('Prediction failed: ' + txt);
     return null;
   }
   const data = await r.json();
@@ -462,7 +478,35 @@ def read_policy(name: str = Query("default", description="Policy name to inspect
 
 
 @app.post("/predict_ab", response_model=ABResponse, tags=["ab"])
-def predict_ab(req: ABRequest):
+def predict_ab(req: ABRequest, request: Request):  # ← modified to accept Request
+    """
+    Predict with A/B policy selection.
+    Monetization enforcement:
+      - Resolve (client_id, plan) via headers/IP
+      - Increment usage and enforce FREE tier cap
+      - On cap exceeded: HTTP 429 + X-Monetization-Exit header
+    """
+    # ---- Monetization enforcement (10B) ----
+    client_id, plan = resolve_client(request)
+    allowed, used, cap = get_guard().check_and_increment(client_id, plan)
+    if not allowed:
+        headers = {
+            "X-Monetization-Exit": "CAP_EXCEEDED",
+            "X-Monetization-Client": client_id,
+            "X-Monetization-Plan": plan.value,
+            "Retry-After": "60",  # generic; true reset is next UTC midnight
+        }
+        body = {
+            "code": "MONETIZATION_CAP_EXCEEDED",
+            "message": "Daily request cap reached for your plan.",
+            "plan": plan.value,
+            "usage_today": used,
+            "daily_cap": cap,
+            "retry_at_utc": next_utc_midnight_iso(),
+        }
+        return JSONResponse(status_code=429, content=body, headers=headers)
+
+    # ---- Normal flow below ----
     t0 = time.time()
     group, blender = assign_ab(req.user_id)
     picked = blender.choose_policy(stochastic=not req.deterministic)
@@ -487,7 +531,7 @@ def predict_ab(req: ABRequest):
 
     took_ms = int((time.time() - t0) * 1000)
 
-    # NEW (7B): persist interaction for FK + leaderboard attribution
+    # persist interaction for FK + leaderboard attribution
     interaction_id = str(uuid.uuid4())
     try:
         record_interaction(
@@ -500,7 +544,7 @@ def predict_ab(req: ABRequest):
         log.error(f'ab_track_error interaction_id="{interaction_id}" err="{e}"')
 
     log.info(
-        f'ab_event user_id="{req.user_id}" group="{group}" picked="{picked}" took_ms={took_ms}'
+        f'ab_event user_id="{req.user_id}" group="{group}" picked="{picked}" took_ms={took_ms} client="{client_id}" plan="{plan.value}"'
     )
 
     return ABResponse(
@@ -509,7 +553,7 @@ def predict_ab(req: ABRequest):
         policy_weights=blender.policies,
         response=resp_payload,
         took_ms=took_ms,
-        interaction_id=interaction_id,  # (7B/7C) UI will send this back to /feedback
+        interaction_id=interaction_id,
     )
 
 
@@ -535,7 +579,7 @@ def ab_reset():
     return {"status": "ok", "message": "AB counters reset"}
 
 
-# NEW (7B): leaderboard endpoint (variant-aware)
+# leaderboard endpoint (variant-aware)
 @app.get("/leaderboard", tags=["ab"])
 def leaderboard(days: int = Query(30, ge=1, le=365)):
     """
