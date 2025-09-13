@@ -20,27 +20,28 @@ services:
     env_file:
       - .env.example
     environment:
-      # Keep your existing app envs
       APP_ENV: "dev"
-      # NEW: pass DB_PATH into the container (defaults to /data/engagement.db)
+      # Keep SQLite on a writable volume path
       DB_PATH: "${DB_PATH:-/data/engagement.db}"
     volumes:
-      # NEW: persist the SQLite file to the host
       - ./data:/data:rw
+    # Healthcheck uses /ready now (simpler & aligned with readiness gate)
     healthcheck:
-      test:
-        [
-          "CMD-SHELL",
-          "python - <<'PY'\nimport urllib.request,sys\ntry:\n  urllib.request.urlopen('http://localhost:8001/health',timeout=2).read(); print('ok')\nexcept Exception as e:\n  print(e); sys.exit(1)\nPY"
-        ]
+      test: ["CMD", "curl", "-fsS", "http://localhost:8001/ready"]
       interval: 10s
       timeout: 5s
       retries: 5
+      start_period: 10s
     depends_on:
       worker:
         condition: service_started
     restart: unless-stopped
     logging: *default-logging
+    # Harden runtime: readonly root FS with tmpfs scratch
+    read_only: true
+    tmpfs:
+      - /tmp
+      - /var/tmp
     networks:
       - appnet
 
@@ -67,6 +68,11 @@ services:
       retries: 5
     restart: unless-stopped
     logging: *default-logging
+    # Optional hardening for worker, too
+    read_only: true
+    tmpfs:
+      - /tmp
+      - /var/tmp
     networks:
       - appnet
 

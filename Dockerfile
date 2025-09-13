@@ -38,8 +38,9 @@ LABEL org.opencontainers.image.created=${BUILD_DATE} \
 
 EXPOSE 8001
 
+# Use /ready instead of /health so the container only goes healthy when the app is ready
 HEALTHCHECK --interval=30s --timeout=3s --retries=3 \
-  CMD curl -fsS http://127.0.0.1:${APP_PORT}/health || exit 1
+  CMD curl -fsS http://127.0.0.1:${APP_PORT}/ready || exit 1
 
 USER ${APP_USER}
 
