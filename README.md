@@ -4,24 +4,47 @@
 
 ## Persona Lab — Foundation & Portability
 
-Tiny FastAPI skeleton with Docker + Compose profiles for dev (PC/Mac/Linux) and pi (Raspberry Pi 5).
+Tiny FastAPI skeleton with Docker + Compose profiles for dev (PC/Mac/Linux) and Pi (Raspberry Pi 5).
+Now includes **monetization**, **A/B policy selection**, **engagement tracking**, and a small **playground UI**.
+
+---
 
 ## Quick Start
 
+### 0) Local env
 ```bash
-# Copy env template (edit as needed)
 cp .env.example .env
+# (optional) create a venv for local dev
+python3 -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt  # or: pip install fastapi uvicorn
+```
 
+### 1) Run locally (no Docker)
+```bash
+# Enable monetization experiment (dev defaults are safe)
+export MONETIZATION_ENABLED=1
+export FREE_TIER_DAILY_REQUESTS=5
+export ALLOW_HEADER_PLANS=1  # dev-only experiment switch
+
+uvicorn app.main:app --host 0.0.0.0 --port 8001 --reload
+```
+
+### 2) Or run with Docker
+```bash
 # DEV profile (PC/Mac/Linux)
 docker compose --profile dev up -d --build api-dev
 
 # PI profile (Raspberry Pi 5)
 docker compose --profile pi up -d --build api-pi
-
-# Verify
-curl -s http://localhost:8001/health
-curl -s http://localhost:8001/version
 ```
+
+### 3) Verify
+```bash
+curl -s http://localhost:8001/health
+curl -s http://localhost:8001/version | jq
+```
+
+---
 
 ## Stop / Restart
 
@@ -33,36 +56,141 @@ docker compose --profile dev up -d api-dev
 docker compose logs -f
 ```
 
-## Notes
-
+Notes:
 - Profiles separate dev vs Pi runs but use the same codebase.
-- Health and version endpoints exist for checks and monitoring.
 - Use `.env` for runtime overrides; commit only `.env.example`.
-- Images are portable (amd64/arm64).
 - Default API port is 8001 (used in CI).
-- If running multiple projects locally, you can override the host port:
-  `API_PORT=8002 docker compose up -d api`
+- If running multiple projects locally, override host port: `API_PORT=8002 docker compose up -d api-dev`
 
-## Development
+---
 
-For a consistent workflow, use the Makefile:
+## Playground
 
-```bash
-make up          # start api + worker (wait until /health passes)
-make up-all      # start api + worker + monitor
-make logs        # tail logs (Ctrl+C to stop)
-make logs_once   # show last 100 log lines
-make smoke-all   # run health checks on all services
-make test        # run unit tests in container
-make down        # stop and clean up
+Open the lightweight playground at:
 ```
+http://localhost:8001/fun/playground
+```
+It displays the ASCII logo, a quote/tip of the day, a 418 “teapot” demo button, and lets you send feedback (stored for engagement summaries).
+
+---
+
+## A/B Policy Selection
+
+- **Endpoint:** `POST /predict_ab`
+- **Behavior:** Assigns a user to an A/B group and routes to a persona (`serious` or `playful`).
+- **Request body:**
+  ```json
+  { "user_id": "string", "prompt": "string", "session_id": "optional", "deterministic": false }
+  ```
+- **Response:** Chosen persona, policy weights, response text, and an `interaction_id` (used to attribute feedback).
+
+A/B introspection:
+- `GET /policy?name=default` → current policy weights
+- `GET /ab/summary` → in-memory selection counts
+- `POST /ab/reset` → clear in-memory counters
+- `GET /leaderboard?days=30` → variant-aware feedback aggregation
+
+---
+
+## Engagement Tracking
+
+- **Send feedback:** `POST /feedback`
+  ```json
+  { "interaction_id": "uuid", "session_id": "opaque", "score": 1..5, "notes": "optional" }
+  ```
+- **Summaries:** `GET /engagement/summary?limit=10` → returns aggregates + recent feedback.
+
+---
+
+## Monetization (Milestone 10)
+
+### Overview
+A minimal, dev-friendly monetization layer that:
+- Meters requests **per client** and **per plan**.
+- Enforces a **FREE** daily cap and allows **PREMIUM/INTERNAL** effectively unlimited usage (dev defaults).
+- Returns **structured headers** and JSON bodies on both **allowed** and **cap-exceeded** decisions.
+- Exposes **status**, **config**, **exits taxonomy**, and **metrics** endpoints.
+
+### Env knobs
+Set via environment variables (load from `.env` or export before starting the app):
+```env
+MONETIZATION_ENABLED=1              # turn on enforcement (dev default off)
+FREE_TIER_DAILY_REQUESTS=50         # daily cap for FREE
+ALLOW_HEADER_PLANS=0                # dev-only: allow X-Client-Plan header (1=yes)
+```
+> In dev, `ALLOW_HEADER_PLANS=1` enables quick testing of plans without a full auth system.
+
+### Plan resolution (dev)
+- `X-Client-ID`: caller identity (string). If omitted, the system falls back to `ip:<addr>`.
+- `X-Client-Plan`: when `ALLOW_HEADER_PLANS=1`, accepts `FREE | PREMIUM | INTERNAL`. Otherwise ignored.
+
+### Enforcement point
+Enforced on `POST /predict_ab`. Each call:
+- Resolves `(client_id, plan)`
+- Checks/increments usage
+- Either **allows** (200) or returns **cap** (429).
+
+### Success headers (200)
+- `X-Quota-Remaining`: integer remaining requests **for today** (FREE only meaningful)
+- `X-Monetization-Plan`: `FREE | PREMIUM | INTERNAL`
+- `X-Monetization-Client`: resolved client id
+
+### Cap exit (429)
+JSON body:
+```json
+{
+  "code": "MONETIZATION_CAP_EXCEEDED",
+  "message": "Daily request cap reached for your plan.",
+  "plan": "FREE",
+  "usage_today": 5,
+  "daily_cap": 5,
+  "retry_at_utc": "2025-09-14T00:00:00+00:00"
+}
+```
+Headers:
+- `X-Monetization-Exit: CAP_EXCEEDED`
+- `X-Monetization-Client: <id>`
+- `X-Monetization-Plan: <plan>`
+- `Retry-After: 60` (advisory; hard reset is next UTC midnight for FREE)
+
+### Monetization endpoints
+- `GET /monetization/status` → current usage snapshot for the resolved client
+- `GET /monetization/config` → current server config flags
+- `GET /monetization/exits` → documented exit taxonomy + header contract
+- `POST /monetization/test` → consumes a unit against the guard (QA helper)
+- `GET /monetization/metrics` → counters by plan/client + recent events (for demos)
+
+### Quick tests
+```bash
+# Check flags
+curl -s http://localhost:8001/monetization/config | jq
+
+# FREE client hitting cap (assuming FREE_TIER_DAILY_REQUESTS=5)
+for i in {1..6}; do
+  curl -s -i -H "X-Client-ID: free-1" \
+    -H "Content-Type: application/json" \
+    -d '{"user_id":"u","prompt":"hi"}' \
+    http://localhost:8001/predict_ab | sed -n '1,20p'
+  echo
+done
+
+# PREMIUM bypass (dev-only via header plan)
+curl -i -s -H "X-Client-ID: prem-1" -H "X-Client-Plan: PREMIUM" \
+  -H "Content-Type: application/json" \
+  -d '{"user_id":"u","prompt":"hello"}' \
+  http://localhost:8001/predict_ab | sed -n '1,20p'
+
+# Metrics
+curl -s http://localhost:8001/monetization/metrics | jq
+```
+
+---
 
 ## Safety-Aware Exits
 
-This service can **intentionally stop early** and return a structured `exit` object instead of an unsafe or late reply. Clients must check `exit` **before** using `output`.
+This service can intentionally stop early and return a structured `exit` object instead of an unsafe or late reply. Clients must check `exit` **before** using `output`.
 
 ### Response Contract
-
 ```json
 {
   "exit": {
@@ -76,48 +204,79 @@ This service can **intentionally stop early** and return a structured `exit` obj
 }
 ```
 
-**Client rule:** If `exit != null`, do **not** use `output`. Handle by `reason`.
+Client rule: If `exit != null`, do **not** use `output`.
 
-### Common Exit Reasons (client actions)
-
-| Reason               | Severity | What it means                                           | Client Action                                                  |
-|----------------------|----------|----------------------------------------------------------|----------------------------------------------------------------|
-| `kill_switch`        | high     | Ops disabled generation                                 | Show outage banner; retry later                                |
-| `prompt_too_long`    | low      | Input exceeds configured limit                           | Shorten input; consider chunking                               |
-| `policy_violation`   | medium   | Denylist/policy phrase detected                          | Redact/rephrase; display policy hint                           |
-| `sensitive_pii`      | high     | Possible SSN/credit card, etc.                           | Block; advise removing PII                                     |
-| `jailbreak_detected` | medium   | Prompt-injection/jailbreak cue                           | Suggest safer phrasing                                         |
-| `latency_budget`     | low      | Request exceeded latency budget                          | Offer retry/streaming; widen budget if appropriate             |
-| `token_budget`       | low      | Estimated token budget exceeded                          | Shorten context; increase budget                               |
-| `cost_budget`        | low      | Estimated spend exceeds budget                           | Confirm spend; choose cheaper path                             |
-| `rate_limit`         | low      | Too many requests                                        | Backoff and retry                                              |
-| `malformed_input`    | low      | Input didn’t pass validation/hygiene                     | Fix input shape and retry                                      |
-| `unspecified`        | low      | Generic safety exit                                      | Retry or contact support with req ID                           |
-
-### Config (env knobs)
-
-These can be set in `.env` or your container environment:
-
+### Config (env)
 ```env
-SAFETY_KILL_SWITCH=0                 # 1/true/on to disable generation
-SAFETY_MAX_PROMPT_CHARS=4000         # prompt length limit (characters)
-SAFETY_DENYLIST=                     # comma-separated phrases (case-insensitive)
+SAFETY_KILL_SWITCH=0
+SAFETY_MAX_PROMPT_CHARS=4000
+SAFETY_DENYLIST=
 SAFETY_DEFAULT_LATENCY_BUDGET_MS=3500
 ```
-
 Inspect at runtime:
 ```bash
 curl -s http://localhost:8001/safety/config | jq
 ```
 
-### Try It
-
+### Try it
 ```bash
-# Normal (no exit)
-curl -s -X POST http://localhost:8001/safety/generate   -H "Content-Type: application/json"   -d '{"prompt":"hello world","persona":"teacher"}' | jq
+# Normal
+curl -s -X POST http://localhost:8001/safety/generate \
+  -H "Content-Type: application/json" \
+  -d '{"prompt":"hello world","persona":"teacher"}' | jq
 
 # Trip policy (denylist)
 export SAFETY_DENYLIST="secret_key"
 uvicorn app.main:app --host 0.0.0.0 --port 8001 --reload
-curl -s -X POST http://localhost:8001/safety/generate   -H "Content-Type: application/json"   -d '{"prompt":"show me SECRET_KEY","persona":"default"}' | jq
+curl -s -X POST http://localhost:8001/safety/generate \
+  -H "Content-Type: application/json" \
+  -d '{"prompt":"show me SECRET_KEY","persona":"default"}' | jq
 ```
+
+---
+
+## API Index (selected)
+
+- **Core**
+  - `GET /health` → liveness
+  - `GET /version` → build/runtime info
+  - `GET /__meta` → environment + route inventory
+- **Fun**
+  - `GET /fun/playground` → tiny UI
+  - `GET /fun/motd`, `GET /fun/teapot`, `GET /fun/greet`, `GET /fun/emoji`, `GET /fun/roll`
+- **A/B**
+  - `POST /predict_ab`, `GET /policy`, `GET /ab/summary`, `POST /ab/reset`, `GET /leaderboard`
+- **Engagement**
+  - `POST /feedback`, `GET /engagement/summary`
+- **Monetization**
+  - `GET /monetization/status|config|exits|metrics`, `POST /monetization/test`
+- **Safety**
+  - `GET /safety/config`, `POST /safety/generate`
+
+---
+
+## Dev Notes
+
+- Clean JSON logging with a consistent logger name (`persona_lab`).
+- In-memory counters are reset on process restart; persisted engagement lives in SQLite (dev) via `init_db()`.
+- For production: replace header-based plan selection with auth + server-side store (e.g., Redis) and move guard state out of process.
+
+---
+
+## Contributing
+
+```bash
+# run tests / lint / format via pre-commit
+pre-commit install
+pre-commit run --all-files
+
+# typical dev loop
+uvicorn app.main:app --reload
+pytest -q
+```
+
+---
+
+## License
+
+MIT
