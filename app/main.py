@@ -27,6 +27,7 @@ from app.engagement import (
     init_db,
     insert_feedback,
 )
+from app.metrics import MetricsMiddleware, metrics_endpoint
 from app.monetization.constants import (
     EXIT_CAP_EXCEEDED,
     HDR_CLIENT,
@@ -120,6 +121,22 @@ app = FastAPI(
 
 log = setup_json_logging("persona_lab")
 app.add_middleware(RequestIdMiddleware, logger=log)
+
+# ------------------------------------------------------------------------------
+# Prometheus metrics
+# ------------------------------------------------------------------------------
+
+# Skip tracking for /metrics itself to avoid recursion
+app.add_middleware(
+    MetricsMiddleware,
+    skip_predicate=lambda req: req.url.path == "/metrics",
+)
+
+
+@app.get("/metrics")
+def _metrics():
+    return metrics_endpoint()
+
 
 # ------------------------------------------------------------------------------
 # Routers
@@ -477,9 +494,7 @@ async function sendFeedback(score) {
 
 function toast(msg) {
   const el = document.getElementById('toast');
-  el.textContent = msg;
-  el.style.display = 'block';
-  setTimeout(() => el.style.display = 'none', 1800);
+  return (el.textContent = msg, el.style.display = 'block', setTimeout(() => el.style.display = 'none', 1800));
 }
 
 function confetti() {
