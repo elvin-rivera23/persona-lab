@@ -10,22 +10,33 @@ from collections import Counter
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from threading import Lock
-from typing import Any
+from typing import Annotated, Any
 
-from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response
 from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel, Field
 
 from app.ab_track import aggregate_with_feedback, record_interaction
 from app.ab_track import init as ab_init
-from app.deps import resolve_client  # ← NEW
-from app.engagement import get_feedback_summary, get_recent_feedback, init_db, insert_feedback
-from app.monetization.router import (
-    get_guard,  # ← NEW
+from app.deps import resolve_client
+from app.engagement import (
+    get_feedback_summary,
+    get_recent_feedback,
+    init_db,
+    insert_feedback,
 )
-from app.monetization.router import (
-    router as monetization_router,  # ← NEW
+from app.monetization.constants import (
+    EXIT_CAP_EXCEEDED,
+    HDR_CLIENT,
+    HDR_EXIT,
+    HDR_PLAN,
+    HDR_QUOTA_REMAINING,
+    HDR_RETRY_AFTER,
 )
+from app.monetization.metrics import metrics
+from app.monetization.models import MonetizationPlan
+from app.monetization.router import get_guard
+from app.monetization.router import router as monetization_router
 from app.personas.playful import respond as playful_respond
 from app.personas.serious import respond as serious_respond
 from app.policy.ab import assign_ab, get_policy
@@ -33,12 +44,17 @@ from app.safety.generate_router import router as generate_router
 from app.safety.router import router as safety_router
 from app.worker.personality import ASCII_LOGO, QUOTES, TIPS
 
+# ------------------------------------------------------------------------------
+# Application metadata
+# ------------------------------------------------------------------------------
+
 APP_NAME = "persona-lab"
 APP_DESC = "A tiny FastAPI service that is portable to Raspberry Pi and PC — now with personality."
 APP_VERSION_FILE = Path(__file__).resolve().parents[1] / "VERSION"
 
 
 def read_version_fallback() -> str:
+    """Return a version string from VERSION file; fall back to 0.0.0 if unavailable."""
     try:
         return APP_VERSION_FILE.read_text(encoding="utf-8").strip()
     except Exception:
@@ -50,14 +66,14 @@ def utc_now_iso() -> str:
 
 
 def next_utc_midnight_iso() -> str:
-    """Return the next UTC midnight boundary in ISO-8601."""
+    """Compute the next UTC midnight timestamp in ISO-8601."""
     now = datetime.now(UTC)
     tomorrow = (now + timedelta(days=1)).date()
     nxt = datetime(tomorrow.year, tomorrow.month, tomorrow.day, tzinfo=UTC)
     return nxt.isoformat()
 
 
-# Env-configured runtime info
+# Environment-configured runtime info (used in /version and /fun/motd)
 HOST = os.getenv("APP_HOST", "0.0.0.0")
 PORT = int(os.getenv("APP_PORT", "8001"))
 WORKERS = int(os.getenv("APP_WORKERS", "1"))
@@ -71,11 +87,12 @@ app = FastAPI(
 # Routers
 app.include_router(safety_router, prefix="/safety")
 app.include_router(generate_router, prefix="/safety")
-app.include_router(monetization_router)  # router provides /monetization/*
+app.include_router(monetization_router)  # provides /monetization/*
 
-# -------------------------
+# ------------------------------------------------------------------------------
 # Logging
-# -------------------------
+# ------------------------------------------------------------------------------
+
 log = logging.getLogger("persona_lab")
 if not log.handlers:
     handler = logging.StreamHandler()
@@ -84,10 +101,11 @@ if not log.handlers:
     log.addHandler(handler)
     log.setLevel(logging.INFO)
 
-
-# -------------------------
+# ------------------------------------------------------------------------------
 # Models & startup
-# -------------------------
+# ------------------------------------------------------------------------------
+
+
 class FeedbackIn(BaseModel):
     session_id: str | None = Field(None, description="Opaque session identifier")
     interaction_id: str | None = Field(None, description="Optional prior interaction id")
@@ -103,7 +121,7 @@ class FeedbackOut(BaseModel):
 class ABRequest(BaseModel):
     user_id: str
     prompt: str
-    session_id: str | None = None  # (7B/7C) allow session attribution
+    session_id: str | None = None  # allows attribution across requests
     deterministic: bool | None = False  # if True, always pick top-weight policy
 
 
@@ -113,18 +131,21 @@ class ABResponse(BaseModel):
     policy_weights: dict[str, float]
     response: dict[str, Any]
     took_ms: int
-    interaction_id: str  # (7B/7C) used by the UI to tie feedback
+    interaction_id: str
 
 
 @app.on_event("startup")
 def _init_engagement_db():
+    """Initialize persistence for engagement tracking and A/B logs."""
     init_db()
-    ab_init()  # ensure ab_interactions + interactions table(s) exist
+    ab_init()
 
 
-# -------------------------
+# ------------------------------------------------------------------------------
 # Core endpoints
-# -------------------------
+# ------------------------------------------------------------------------------
+
+
 @app.get("/health", tags=["core"])
 def health():
     return {"status": "ok"}
@@ -175,9 +196,11 @@ def meta():
     }
 
 
-# -------------------------
+# ------------------------------------------------------------------------------
 # Feedback endpoints
-# -------------------------
+# ------------------------------------------------------------------------------
+
+
 @app.post("/feedback", response_model=FeedbackOut, tags=["core"])
 def post_feedback(payload: FeedbackIn):
     try:
@@ -207,9 +230,10 @@ def engagement_summary(
         ) from e
 
 
-# -------------------------
-# Fun endpoints (with Playground wired for 7C)
-# -------------------------
+# ------------------------------------------------------------------------------
+# Fun endpoints (small interactive playground)
+# ------------------------------------------------------------------------------
+
 GREET_TAGLINES = [
     "Let’s ship something cool today.",
     "Pi-first, portable everywhere.",
@@ -265,7 +289,7 @@ def fun_roll(
 
 @app.get("/fun/teapot", tags=["fun"])
 def fun_teapot():
-    # Tests expect HTTP 418 and JSON including { code: 418 }
+    # Some tests expect HTTP 418 with a JSON body
     body = {"code": 418, "status": "teapot", "message": "I'm a teapot! ☕"}
     return JSONResponse(body, status_code=418)
 
@@ -463,9 +487,10 @@ predict('Hello!').catch(()=>{});
     return HTMLResponse(content=html, status_code=200)
 
 
-# -------------------------
-# A/B policy endpoints (with interaction_id + attribution)
-# -------------------------
+# ------------------------------------------------------------------------------
+# A/B policy endpoints
+# ------------------------------------------------------------------------------
+
 AB_COUNTER = Counter()  # key: (group, persona)
 AB_TOTAL = Counter()  # key: group
 _AB_LOCK = Lock()
@@ -477,46 +502,56 @@ def read_policy(name: str = Query("default", description="Policy name to inspect
     return {"name": name, "weights": blender.policies}
 
 
+# Dependency type for resolving client identity and plan (ruff-friendly)
+ResolvedClient = Annotated[tuple[str, MonetizationPlan], Depends(resolve_client)]
+
+
 @app.post("/predict_ab", response_model=ABResponse, tags=["ab"])
-def predict_ab(req: ABRequest, request: Request):  # ← modified to accept Request
+def predict_ab(req: ABRequest, request: Request, response: Response, id_and_plan: ResolvedClient):
     """
-    Predict with A/B policy selection.
-    Monetization enforcement:
-      - Resolve (client_id, plan) via headers/IP
-      - Increment usage and enforce FREE tier cap
-      - On cap exceeded: HTTP 429 + X-Monetization-Exit header
+    Predict with A/B policy selection. Applies monetization enforcement and
+    records per-plan/client metrics. On success, returns quota headers.
     """
-    # ---- Monetization enforcement (10B) ----
-    client_id, plan = resolve_client(request)
+    # Monetization enforcement
+    client_id, plan = id_and_plan
     allowed, used, cap = get_guard().check_and_increment(client_id, plan)
     if not allowed:
-        headers = {
-            "X-Monetization-Exit": "CAP_EXCEEDED",
-            "X-Monetization-Client": client_id,
-            "X-Monetization-Plan": plan.value,
-            "Retry-After": "60",  # generic; true reset is next UTC midnight
-        }
+        metrics.record(client_id, plan.value, "DENIED_CAP", used, cap)
         body = {
-            "code": "MONETIZATION_CAP_EXCEEDED",
+            "code": EXIT_CAP_EXCEEDED,
             "message": "Daily request cap reached for your plan.",
             "plan": plan.value,
             "usage_today": used,
             "daily_cap": cap,
             "retry_at_utc": next_utc_midnight_iso(),
         }
+        headers = {
+            HDR_EXIT: "CAP_EXCEEDED",
+            HDR_CLIENT: client_id,
+            HDR_PLAN: plan.value,
+            HDR_RETRY_AFTER: "60",
+        }
         return JSONResponse(status_code=429, content=body, headers=headers)
 
-    # ---- Normal flow below ----
+    metrics.record(client_id, plan.value, "ALLOWED", used, cap)
+
+    # Quota headers on success (remaining after this request)
+    remaining = max(0, cap - used)
+    response.headers[HDR_QUOTA_REMAINING] = str(remaining)
+    response.headers[HDR_PLAN] = plan.value
+    response.headers[HDR_CLIENT] = client_id
+
+    # Primary inference flow
     t0 = time.time()
     group, blender = assign_ab(req.user_id)
     picked = blender.choose_policy(stochastic=not req.deterministic)
 
-    # record in-memory counts
+    # Update in-memory A/B counters
     with _AB_LOCK:
         AB_COUNTER[(group, picked)] += 1
         AB_TOTAL[group] += 1
 
-    # route to persona responders
+    # Generate response text from selected persona
     if picked == "serious":
         text = serious_respond(req.prompt)
     elif picked == "playful":
@@ -531,7 +566,7 @@ def predict_ab(req: ABRequest, request: Request):  # ← modified to accept Requ
 
     took_ms = int((time.time() - t0) * 1000)
 
-    # persist interaction for FK + leaderboard attribution
+    # Persist interaction for engagement and attribution
     interaction_id = str(uuid.uuid4())
     try:
         record_interaction(
@@ -559,7 +594,7 @@ def predict_ab(req: ABRequest, request: Request):  # ← modified to accept Requ
 
 @app.get("/ab/summary", tags=["ab"])
 def ab_summary():
-    """Returns counts since process start by group and persona."""
+    """Return in-process A/B selection counts grouped by variant and persona."""
     with _AB_LOCK:
         groups = {}
         for (grp, persona), n in AB_COUNTER.items():
@@ -572,19 +607,18 @@ def ab_summary():
 
 @app.post("/ab/reset", tags=["ab"])
 def ab_reset():
-    """Clears the in-memory counters (useful during demos/tests)."""
+    """Clear the in-memory A/B counters (useful during demos/tests)."""
     with _AB_LOCK:
         AB_COUNTER.clear()
         AB_TOTAL.clear()
     return {"status": "ok", "message": "AB counters reset"}
 
 
-# leaderboard endpoint (variant-aware)
 @app.get("/leaderboard", tags=["ab"])
 def leaderboard(days: int = Query(30, ge=1, le=365)):
     """
-    Aggregated feedback per A/B group and persona using a Wilson lower bound
-    for 'positive' rate (score >= 4) plus average score.
+    Aggregate feedback by A/B group and persona using Wilson lower bound for
+    positive rate (score >= 4) plus average score.
     """
     rows = aggregate_with_feedback(limit_days=days)
     return {"as_of": utc_now_iso(), "days": days, "results": rows}

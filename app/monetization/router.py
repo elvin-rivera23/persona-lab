@@ -5,7 +5,15 @@ from typing import Annotated
 from fastapi import APIRouter, Depends, Request
 
 from app.deps import resolve_client
+from app.monetization.constants import (
+    EXIT_CAP_EXCEEDED,
+    HDR_CLIENT,
+    HDR_EXIT,
+    HDR_PLAN,
+    HDR_RETRY_AFTER,
+)
 from app.monetization.guard import MonetizationGuard
+from app.monetization.metrics import metrics
 from app.monetization.models import (
     MonetizationConfig,
     MonetizationExit,
@@ -18,7 +26,6 @@ router = APIRouter(prefix="/monetization", tags=["monetization"])
 
 _guard = MonetizationGuard()
 
-# Annotated dependency type for ruff B008 compliance
 ResolvedClient = Annotated[tuple[str, MonetizationPlan], Depends(resolve_client)]
 
 
@@ -55,22 +62,22 @@ def get_exits_doc():
     """
     exits = [
         MonetizationExit(
-            code="MONETIZATION_CAP_EXCEEDED",
+            code=EXIT_CAP_EXCEEDED,
             http_status=429,
             summary="Daily request cap reached for your plan.",
             headers={
-                "X-Monetization-Exit": "Machine-readable exit reason",
-                "X-Monetization-Client": "Resolved client id used for metering",
-                "X-Monetization-Plan": "Resolved plan (FREE|PREMIUM|INTERNAL)",
-                "Retry-After": "Seconds until a generic retry is advisable",
+                HDR_EXIT: "Machine-readable exit reason",
+                HDR_CLIENT: "Resolved client id used for metering",
+                HDR_PLAN: "Resolved plan (FREE|PREMIUM|INTERNAL)",
+                HDR_RETRY_AFTER: "Seconds until a generic retry is advisable",
             },
         ),
     ]
     header_contract = {
-        "X-Monetization-Exit": "Stable exits like CAP_EXCEEDED",
-        "X-Monetization-Client": "Echo of the metered client id",
-        "X-Monetization-Plan": "Resolved plan at time of decision",
-        "Retry-After": "Advisory seconds; true reset is next UTC midnight for FREE",
+        HDR_EXIT: "Stable exits like CAP_EXCEEDED",
+        HDR_CLIENT: "Echo of the metered client id",
+        HDR_PLAN: "Resolved plan at time of decision",
+        HDR_RETRY_AFTER: "Advisory seconds; true reset is next UTC midnight for FREE",
     }
     return MonetizationExitsDoc(
         exits=exits,
@@ -86,7 +93,9 @@ def test_consume_one(request: Request, id_and_plan: ResolvedClient):
     then returns the updated status snapshot.
     """
     client_id, plan = id_and_plan
-    _guard.check_and_increment(client_id, plan)
+    allowed, used, cap = _guard.check_and_increment(client_id, plan)
+    outcome = "ALLOWED" if allowed else "DENIED_CAP"
+    metrics.record(client_id, plan.value, f"TEST_{outcome}", used, cap)
     usage, cap = _guard.snapshot(client_id, plan)
     return MonetizationStatus(
         client_id=client_id,
