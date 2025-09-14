@@ -37,38 +37,49 @@ jobs:
           python -m pip install --upgrade pip
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
           if [ -f requirements-dev.txt ]; then pip install -r requirements-dev.txt; fi
-          pip install pytest
+          pip install pytest ruff black
+
+      - name: Ruff (lint)
+        run: ruff check .
+
+      - name: Black (format check)
+        run: black --check .
 
       - name: Run pytest
         run: pytest -q --disable-warnings -x
 
-
   compose-smoke:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
-    services:
-      docker:
-        image: docker:dind
-        # dind provided automatically on ubuntu-latest; this service block is optional
+    timeout-minutes: 15
+    needs: [unit-tests]
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Set up Docker Compose
+      - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Compose up (api + worker only)
-        run: docker compose up -d
-
-      - name: Wait for API health
+      - name: Compose up (build + start api/worker)
         run: |
-          for i in {1..30}; do
-            if curl -fsS http://localhost:8001/health >/dev/null 2>&1; then
-              echo "API healthy ✅"; exit 0
+          docker compose up -d --build
+          docker compose ps
+
+      - name: Wait for API readiness (/ready)
+        run: |
+          for i in {1..40}; do
+            if curl -fsS http://localhost:8001/ready >/dev/null 2>&1; then
+              echo "API ready ✅"; exit 0
             fi
             sleep 1
           done
-          echo "API failed to become healthy ❌"; docker compose logs --no-color api; exit 1
+          echo "API failed to become ready ❌"
+          echo "----- api logs -----"
+          docker compose logs --no-color api || true
+          exit 1
+
+      - name: Probe /metrics (sanity)
+        run: |
+          curl -fsS http://localhost:8001/metrics | head -n 40
 
       - name: Check Worker health
         run: |
@@ -77,4 +88,4 @@ jobs:
 
       - name: Teardown
         if: always()
-        run: docker compose down --remove-orphans
+        run: docker compose down --remove-orphans -v

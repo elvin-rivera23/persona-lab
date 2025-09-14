@@ -22,6 +22,10 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY app ./app
 COPY VERSION ./VERSION
 
+# Ensure runtime user can read/execute the code
+RUN chown -R ${APP_USER}:${APP_USER} ${APP_HOME} \
+ && chmod -R a+rX ${APP_HOME}
+
 # Runtime env (can be overridden)
 ENV APP_HOST=0.0.0.0 \
     APP_PORT=8001 \
@@ -38,8 +42,9 @@ LABEL org.opencontainers.image.created=${BUILD_DATE} \
 
 EXPOSE 8001
 
+# Use /ready instead of /health so the container only goes healthy when the app is ready
 HEALTHCHECK --interval=30s --timeout=3s --retries=3 \
-  CMD curl -fsS http://127.0.0.1:${APP_PORT}/health || exit 1
+  CMD curl -fsS http://127.0.0.1:${APP_PORT}/ready || exit 1
 
 USER ${APP_USER}
 

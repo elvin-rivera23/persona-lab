@@ -5,7 +5,7 @@
 ## Persona Lab — Foundation & Portability
 
 Tiny FastAPI skeleton with Docker + Compose profiles for dev (PC/Mac/Linux) and Pi (Raspberry Pi 5).
-Now includes **monetization**, **A/B policy selection**, **engagement tracking**, and a small **playground UI**.
+Includes **monetization**, **A/B policy selection**, **engagement tracking**, **safety exits**, **observability**, and a small **playground UI**.
 
 ---
 
@@ -102,7 +102,7 @@ A/B introspection:
 
 ---
 
-## Monetization (Milestone 10)
+## Monetization
 
 ### Overview
 A minimal, dev-friendly monetization layer that:
@@ -160,30 +160,6 @@ Headers:
 - `POST /monetization/test` → consumes a unit against the guard (QA helper)
 - `GET /monetization/metrics` → counters by plan/client + recent events (for demos)
 
-### Quick tests
-```bash
-# Check flags
-curl -s http://localhost:8001/monetization/config | jq
-
-# FREE client hitting cap (assuming FREE_TIER_DAILY_REQUESTS=5)
-for i in {1..6}; do
-  curl -s -i -H "X-Client-ID: free-1" \
-    -H "Content-Type: application/json" \
-    -d '{"user_id":"u","prompt":"hi"}' \
-    http://localhost:8001/predict_ab | sed -n '1,20p'
-  echo
-done
-
-# PREMIUM bypass (dev-only via header plan)
-curl -i -s -H "X-Client-ID: prem-1" -H "X-Client-Plan: PREMIUM" \
-  -H "Content-Type: application/json" \
-  -d '{"user_id":"u","prompt":"hello"}' \
-  http://localhost:8001/predict_ab | sed -n '1,20p'
-
-# Metrics
-curl -s http://localhost:8001/monetization/metrics | jq
-```
-
 ---
 
 ## Safety-Aware Exits
@@ -206,31 +182,56 @@ This service can intentionally stop early and return a structured `exit` object 
 
 Client rule: If `exit != null`, do **not** use `output`.
 
-### Config (env)
-```env
-SAFETY_KILL_SWITCH=0
-SAFETY_MAX_PROMPT_CHARS=4000
-SAFETY_DENYLIST=
-SAFETY_DEFAULT_LATENCY_BUDGET_MS=3500
-```
-Inspect at runtime:
-```bash
-curl -s http://localhost:8001/safety/config | jq
-```
+---
 
-### Try it
-```bash
-# Normal
-curl -s -X POST http://localhost:8001/safety/generate \
-  -H "Content-Type: application/json" \
-  -d '{"prompt":"hello world","persona":"teacher"}' | jq
+## Observability & Ops
 
-# Trip policy (denylist)
-export SAFETY_DENYLIST="secret_key"
-uvicorn app.main:app --host 0.0.0.0 --port 8001 --reload
-curl -s -X POST http://localhost:8001/safety/generate \
-  -H "Content-Type: application/json" \
-  -d '{"prompt":"show me SECRET_KEY","persona":"default"}' | jq
+### Endpoints
+- `GET /live` → liveness probe
+- `GET /ready` → readiness probe
+- `GET /metrics` → Prometheus-format metrics
+
+### Observability
+- Structured **JSON logs** with request IDs.
+- Clean separation between stdout (logs) and HTTP responses.
+- Request tracing via `X-Request-ID`.
+
+### Dockerfile & Compose
+- Runs as **non-root** (`appuser`) with `readOnlyRootFilesystem`.
+- **OCI image labels**: build date, git SHA, git branch.
+- Built-in **HEALTHCHECK** (calls `/health`).
+- Compose services:
+  - `api` → FastAPI service
+  - `worker` → background worker with health server
+  - `monitor` → placeholder (nginx)
+  - `test` → one-shot pytest runner
+- SQLite persisted at `./data/engagement.db`.
+
+### Kubernetes (k8s/)
+- **Deployment**: `persona-lab-api:latest`, probes, securityContext.
+- **Service**: ClusterIP, port 8001.
+- **PersistentVolumeClaim**: 1Gi `local-path`.
+- **HorizontalPodAutoscaler**: scale 1–5 pods on CPU >70%.
+- **Ingress**: routes `http://persona.local` → service.
+- Uses `fsGroupChangePolicy: OnRootMismatch` for volume mounts.
+- Tested locally with **k3s** + `kubectl port-forward` and ingress via `/etc/hosts`.
+
+#### Kubernetes quick start (k3s)
+```bash
+# Import image into k3s
+docker build -t persona-lab-api:latest .
+docker image save persona-lab-api:latest -o persona-lab-api.tar
+sudo k3s ctr images import persona-lab-api.tar
+
+# Deploy manifests
+kubectl create namespace persona-lab
+kubectl apply -k k8s/
+
+# Verify
+kubectl -n persona-lab get pods
+kubectl -n persona-lab port-forward svc/persona-lab 8001:8001 &
+curl -s http://localhost:8001/ready
+curl -s http://localhost:8001/metrics | head -n 10
 ```
 
 ---
@@ -238,12 +239,9 @@ curl -s -X POST http://localhost:8001/safety/generate \
 ## API Index (selected)
 
 - **Core**
-  - `GET /health` → liveness
-  - `GET /version` → build/runtime info
-  - `GET /__meta` → environment + route inventory
+  - `GET /health`, `GET /version`, `GET /__meta`
 - **Fun**
-  - `GET /fun/playground` → tiny UI
-  - `GET /fun/motd`, `GET /fun/teapot`, `GET /fun/greet`, `GET /fun/emoji`, `GET /fun/roll`
+  - `GET /fun/playground`, `GET /fun/motd`, `GET /fun/teapot`, `GET /fun/greet`, `GET /fun/emoji`, `GET /fun/roll`
 - **A/B**
   - `POST /predict_ab`, `GET /policy`, `GET /ab/summary`, `POST /ab/reset`, `GET /leaderboard`
 - **Engagement**
@@ -252,14 +250,8 @@ curl -s -X POST http://localhost:8001/safety/generate \
   - `GET /monetization/status|config|exits|metrics`, `POST /monetization/test`
 - **Safety**
   - `GET /safety/config`, `POST /safety/generate`
-
----
-
-## Dev Notes
-
-- Clean JSON logging with a consistent logger name (`persona_lab`).
-- In-memory counters are reset on process restart; persisted engagement lives in SQLite (dev) via `init_db()`.
-- For production: replace header-based plan selection with auth + server-side store (e.g., Redis) and move guard state out of process.
+- **Ops**
+  - `GET /live`, `GET /ready`, `GET /metrics`
 
 ---
 
